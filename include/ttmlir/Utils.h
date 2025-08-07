@@ -40,9 +40,19 @@ constexpr inline llvm::StringLiteral g_outputMemoryConfigAttrName =
     "memory_config";
 
 template <typename T>
-T alignUp(T ptr, T alignment) {
-  T distance = ptr % alignment;
-  return ptr + (distance == 0 ? 0 : (alignment - distance));
+T alignUp(const T val, const T alignment) {
+  if (alignment == 0 || alignment == 1) {
+    return val;
+  }
+  return ((val + alignment - 1) / alignment) * alignment;
+}
+
+template <typename Iter>
+auto product(const Iter begin, const Iter end) ->
+    typename std::iterator_traits<Iter>::value_type {
+  using ValueType = typename std::iterator_traits<Iter>::value_type;
+  return std::accumulate(begin, end, static_cast<ValueType>(1),
+                         std::multiplies<ValueType>());
 }
 
 template <typename T>
