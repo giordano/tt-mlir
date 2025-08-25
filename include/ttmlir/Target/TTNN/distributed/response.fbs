@@ -32,23 +32,25 @@ table OpenMeshDeviceResponse {
 }
 
 table CloseMeshDeviceResponse {
-  success: bool;
 }
 
 table CreateHostTensorResponse {
-  output_global_id: uint64;
 }
 
 table ToLayoutResponse {
-  output_global_id: uint64;
 }
 
 table SubmitResponse {
-  output_global_ids: [uint64];
+}
+
+table ToHostResponse {
+}
+
+table MemcpyResponse {
+  data: [ubyte];
 }
 
 table ShutdownResponse {
-  success: bool;
 }
 
 union ResponseType {
@@ -59,6 +61,8 @@ union ResponseType {
   CreateHostTensorResponse,
   ToLayoutResponse,
   SubmitResponse,
+  ToHostResponse,
+  MemcpyResponse,
   ShutdownResponse,
 }
 

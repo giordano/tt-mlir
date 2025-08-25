@@ -20,7 +20,9 @@ uint64_t TTNNTensorWrapper::getLatestVersion() {
 //
 // LayoutDesc APIs
 //
-LayoutDesc LayoutDesc::fromTensor(const ::tt::runtime::Tensor &tensor) {
+
+std::shared_ptr<LayoutDesc>
+LayoutDesc::fromTensor(const ::tt::runtime::Tensor &tensor) {
   const ::ttnn::Tensor &ttnnTensor =
       ::tt::runtime::ttnn::utils::getTTNNTensorFromRuntimeTensor(tensor);
   ::ttnn::StorageType storageType = ttnnTensor.storage_type();
@@ -32,7 +34,20 @@ LayoutDesc LayoutDesc::fromTensor(const ::tt::runtime::Tensor &tensor) {
     memoryConfig = ttnnTensor.memory_config();
   }
 
-  return LayoutDesc(storageType, layout, dtype, memoryConfig);
+  return std::make_shared<LayoutDesc>(storageType, layout, dtype, memoryConfig);
+}
+
+std::shared_ptr<LayoutDesc>
+LayoutDesc::fromMemoryDesc(const ::tt::target::ttnn::MemoryDesc *memoryDesc) {
+  ::ttnn::StorageType storageType =
+      utils::toTTNNStorageType(memoryDesc->storage_type());
+  ::ttnn::Layout layout =
+      utils::inferLayoutFromTileShape(memoryDesc->tile_shape());
+  ::ttnn::DataType dtype = utils::toTTNNDataType(memoryDesc->data_type());
+  std::optional<::ttnn::MemoryConfig> memoryConfig =
+      utils::createMemoryConfigIfNeeded(memoryDesc->memory_config());
+
+  return std::make_shared<LayoutDesc>(storageType, layout, dtype, memoryConfig);
 }
 
 LayoutDesc::LayoutDesc(const ::ttnn::StorageType &storageType,

@@ -5,6 +5,7 @@ include "ttmlir/Target/TTNN/binary.fbs";
 namespace tt.target.ttnn.distributed;
 
 table GetSystemDescCommand {
+  device: tt.target.DeviceRef;
   dispatch_core_type: tt.target.DispatchCoreType;
 }
 
@@ -29,6 +30,7 @@ table CloseMeshDeviceCommand {
 }
 
 table CreateHostTensorCommand {
+  output_global_id: uint64;
   data: [ubyte];
   shape: [uint32];
   stride: [uint32];
@@ -40,15 +42,30 @@ table ToLayoutCommand {
   input_global_id: uint64;
   output_global_id: uint64;
   device: tt.target.DeviceRef;
-  layout: tt.target.ttnn.MemoryDesc;
+  memory_desc: tt.target.ttnn.MemoryDesc;
+  retain: bool = null;
 }
 
 table SubmitCommand {
   input_global_ids: [uint64];
   output_global_ids: [uint64];
+  binary_id: uint64;
   binary: [ubyte]; // raw bytes of size-prefixed TTNNBinary
   program_id: uint32;
   device: tt.target.DeviceRef;
+}
+
+table ToHostCommand {
+  input_global_id: uint64;
+  output_global_ids: [uint64];
+  untilize: bool;
+  blocking: bool;
+}
+
+table MemcpyCommand {
+  src_global_id: uint64;
+  dst_global_id: uint64 = null; // If null, will send raw data to the server in the response
+  dst_data_type: tt.target.DataType = null;
 }
 
 table ShutdownCommand {
@@ -61,6 +78,8 @@ union CommandType {
   CreateHostTensorCommand,
   ToLayoutCommand,
   SubmitCommand,
+  ToHostCommand,
+  MemcpyCommand,
   ShutdownCommand,
 }
 

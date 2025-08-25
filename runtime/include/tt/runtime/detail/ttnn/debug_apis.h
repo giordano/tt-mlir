@@ -84,6 +84,16 @@ checkTensorRefMatchesTTNNTensor(const ::tt::target::ttnn::TensorRef *tensorRef,
 }
 #endif
 
+template <typename Func>
+void verifyFlatbuffer(const ::flatbuffers::FlatBufferBuilder &fbb,
+                      const Func &verifierFn) {
+#if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+  ::flatbuffers::Verifier verifier(fbb.GetBufferPointer(), fbb.GetSize());
+  bool valid = verifierFn(verifier);
+  DEBUG_ASSERT(valid, "Failed to verify flatbuffer");
+#endif
+}
+
 #undef RUNTIME_DEBUG_MAYBE_INLINE
 
 } // namespace tt::runtime::ttnn::debug

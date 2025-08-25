@@ -59,16 +59,6 @@ enum class DispatchCoreType {
   ETH,
 };
 
-inline ::tt::target::DispatchCoreType
-toFlatbuffer(const ::tt::runtime::DispatchCoreType &dispatchCoreType) {
-  switch (dispatchCoreType) {
-  case ::tt::runtime::DispatchCoreType::WORKER:
-    return ::tt::target::DispatchCoreType::Worker;
-  case ::tt::runtime::DispatchCoreType::ETH:
-    return ::tt::target::DispatchCoreType::Ethernet;
-  }
-}
-
 enum class FabricConfig {
   DISABLED,
   FABRIC_1D,
@@ -226,10 +216,6 @@ struct MeshDeviceOptions {
   std::optional<DispatchCoreType> dispatchCoreType = std::nullopt;
 };
 
-struct Connection : public detail::ObjectImpl {
-  using detail::ObjectImpl::ObjectImpl;
-};
-
 struct Flatbuffer : public detail::ObjectImpl {
   using detail::ObjectImpl::ObjectImpl;
 
@@ -294,6 +280,7 @@ struct Binary : public Flatbuffer {
   const std::pair<std::uint32_t, std::uint32_t>
   getProgramMeshShape(std::uint32_t programIndex) const;
 
+  void setId(std::uint64_t id) { binaryId = id; }
   std::uint64_t id() const;
 
   // Get the tensor cache associated with this binary
@@ -315,14 +302,13 @@ struct TraceCache : public detail::RuntimeCheckedObjectImpl {
 struct Device : public detail::RuntimeCheckedObjectImpl {
 
   Device(std::shared_ptr<void> handle, std::shared_ptr<TraceCache> traceCache,
-         DeviceRuntime runtime,
-         std::optional<std::uint32_t> globalId = std::nullopt)
+         DeviceRuntime runtime)
       : detail::RuntimeCheckedObjectImpl(handle, runtime),
-        globalId(globalId.value_or(nextDeviceGlobalId())),
-        traceCache(traceCache) {}
+        globalId(nextDeviceGlobalId()), traceCache(traceCache) {}
 
   std::shared_ptr<TraceCache> getTraceCache() { return traceCache; }
 
+  void setGlobalId(std::uint32_t id) { globalId = id; }
   std::uint32_t getGlobalId() const { return globalId; }
 
 private:
@@ -344,12 +330,12 @@ struct Tensor : public detail::RuntimeCheckedObjectImpl {
 
   Tensor(std::shared_ptr<void> handle, std::shared_ptr<void> data,
          DeviceRuntime runtime,
-         std::optional<std::shared_ptr<void>> eventHandle = std::nullopt,
-         std::optional<std::uint64_t> globalId = std::nullopt)
+         std::optional<std::shared_ptr<void>> eventHandle = std::nullopt)
       : detail::RuntimeCheckedObjectImpl(handle, runtime), data(data),
         event(eventHandle.value_or(nullptr), runtime),
-        globalId(globalId.value_or(nextTensorGlobalId())) {}
+        globalId(nextTensorGlobalId()) {}
 
+  void setGlobalId(std::uint64_t id) { globalId = id; }
   std::uint64_t getGlobalId() const { return globalId; }
 
 private:

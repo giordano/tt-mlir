@@ -266,15 +266,19 @@ fromTTNNStorageType(::ttnn::StorageType storageType) {
   }
 }
 
-::ttnn::Layout
-inferLayoutFromTileShape(const ::tt::target::ttnn::TensorRef *tensorRef) {
-  const ::tt::target::Dim2d *tileShape =
-      tensorRef->desc()->layout()->memory_desc()->tile_shape();
+::ttnn::Layout inferLayoutFromTileShape(const ::tt::target::Dim2d *tileShape) {
   LOG_ASSERT(isValidTileShape(tileShape));
   if (tileShape->x() == 1 && tileShape->y() == 1) {
     return ::ttnn::Layout::ROW_MAJOR;
   }
   return ::ttnn::Layout::TILE;
+}
+
+::ttnn::Layout
+inferLayoutFromTileShape(const ::tt::target::ttnn::TensorRef *tensorRef) {
+  const ::tt::target::Dim2d *tileShape =
+      tensorRef->desc()->layout()->memory_desc()->tile_shape();
+  return inferLayoutFromTileShape(tileShape);
 }
 
 CoreCoord toTTNNCoreCoord(const ::tt::target::ttnn::CoreCoord &coreCoord) {

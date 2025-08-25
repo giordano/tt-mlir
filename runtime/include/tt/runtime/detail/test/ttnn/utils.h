@@ -12,6 +12,11 @@ namespace tt::runtime::test::ttnn {
 Layout getDramInterleavedTileLayout(::tt::target::DataType dataType);
 Layout getDramInterleavedRowMajorLayout(::tt::target::DataType dataType);
 Layout getHostRowMajorLayout(::tt::target::DataType dataType);
+
+// Command creation APIs for testing
+// These will get hidden behind runtime APIs once the runtime server is
+// implemented
+
 } // namespace tt::runtime::test::ttnn
 
 #endif // TT_RUNTIME_DETAIL_TEST_TTNN_UTILS_H

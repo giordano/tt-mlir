@@ -64,6 +64,8 @@ toTTNNStorageType(::tt::target::ttnn::StorageType storageType);
 ::tt::target::ttnn::StorageType
 fromTTNNStorageType(::ttnn::StorageType storageType);
 
+::ttnn::Layout inferLayoutFromTileShape(const ::tt::target::Dim2d *tileShape);
+
 ::ttnn::Layout
 inferLayoutFromTileShape(const ::tt::target::ttnn::TensorRef *tensorRef);
 
