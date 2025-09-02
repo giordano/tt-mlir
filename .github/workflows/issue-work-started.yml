@@ -484,11 +484,13 @@ jobs:
               issue_number="${issue_numbers[$processed_count]}"
 
               # Check if issue number is already in the last processed issue number file
-              grep -q "^$issue_number$" /tmp/last_processed_issue_number.txt
-              if [[ $? -eq 0 ]]; then
-                echo "Issue #$issue_number already processed, skipping..."
-                processed_count=$((processed_count + 1))
-                continue
+              if [[ -f /tmp/last_processed_issue_number.txt ]]; then
+                grep -q "^$issue_number$" /tmp/last_processed_issue_number.txt
+                if [[ $? -eq 0 ]]; then
+                  echo "Issue #$issue_number already processed, skipping..."
+                  processed_count=$((processed_count + 1))
+                  continue
+                fi
               fi
 
               echo "Group $group: Processing issue #$issue_number..."
