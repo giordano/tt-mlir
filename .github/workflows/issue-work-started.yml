@@ -488,9 +488,10 @@ jobs:
 
 
               # Check if issue number is already in the last processed issue number file
-              set -x
               if [[ -f /tmp/last_processed_issue_number.txt ]]; then
+                set +e
                 grep -q "^$issue_number$" /tmp/last_processed_issue_number.txt
+                set -e
                 if [[ $? -eq 0 ]]; then
                   echo "Issue #$issue_number already processed, skipping..."
                   processed_count=$((processed_count + 1))
@@ -736,7 +737,7 @@ jobs:
             done
 
             echo "Waiting for all background jobs to finish"
-            wait < <(jobs -p)
+            wait < <(jobs -p) || exit 1
 
 
           echo "Summary: Processed $processed_count issues, updated $updated_count Work Started fields"
