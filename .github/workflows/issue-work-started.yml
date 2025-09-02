@@ -734,7 +734,7 @@ jobs:
               fi
             done
 
-            # wait for all background jobs to finish
+            echo "Waiting for all background jobs to finish"
             wait < <(jobs -p)
 
 
