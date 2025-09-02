@@ -479,9 +479,13 @@ jobs:
 
             while true; do
               if [[ $processed_count -ge $array_length ]]; then
+                echo "Group $group: $processed_count of $array_length issues processed. Breaking..."
                 break
               fi
+
+              echo " Group $group: Processing issue #$processed_count of $array_length"
               issue_number="${issue_numbers[$processed_count]}"
+
 
               # Check if issue number is already in the last processed issue number file
               if [[ -f /tmp/last_processed_issue_number.txt ]]; then
