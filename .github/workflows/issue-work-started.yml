@@ -488,6 +488,7 @@ jobs:
 
 
               # Check if issue number is already in the last processed issue number file
+              set -x
               if [[ -f /tmp/last_processed_issue_number.txt ]]; then
                 grep -q "^$issue_number$" /tmp/last_processed_issue_number.txt
                 if [[ $? -eq 0 ]]; then
