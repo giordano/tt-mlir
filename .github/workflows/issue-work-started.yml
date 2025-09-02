@@ -372,7 +372,7 @@ jobs:
 
       - name: Restore last processed issue number
         id: cache-last-processed-issue-number
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             /tmp/last_processed_issue_number.txt
@@ -746,3 +746,11 @@ jobs:
           # save unique sorted last processed issue numbers
           cat /tmp/last_processed_issue_number.txt | sort | uniq > /tmp/last_processed_issue_number.txt
           
+      - name: Save last processed issue number
+        id: cache-last-processed-issue-number-save
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /tmp/last_processed_issue_number.txt
+          key: issue-work-started-bulk-update-${{ github.repository }}
