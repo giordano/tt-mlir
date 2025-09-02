@@ -856,7 +856,7 @@ BitwiseXorOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
 }
 
 //===----------------------------------------------------------------------===//
-// Atan2Op - TTNN Op Model Interface - TEMPORARY
+// Atan2Op - TTNN Op Model Interface
 //===----------------------------------------------------------------------===//
 
 llvm::Expected<op_model::OpConstraints>
@@ -872,7 +872,7 @@ Atan2Op::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
 }
 
 //===----------------------------------------------------------------------===//
-// RemainderOp - TTNN Op Model Interface - TEMPORARY
+// RemainderOp - TTNN Op Model Interface
 //===----------------------------------------------------------------------===//
 
 llvm::Expected<op_model::OpConstraints>
