@@ -370,6 +370,14 @@ jobs:
           echo "status_field_id=PVTSSF_lADOA9MHEM4AjeTlzgb1Hjo" >> $GITHUB_ENV
           echo "work_started_field_id=PVTF_lADOA9MHEM4AjeTlzgzZQtk" >> $GITHUB_ENV
 
+      - name: Restore last processed issue number
+        id: cache-last-processed-issue-number
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/last_processed_issue_number.txt
+          key: issue-work-started-bulk-update-${{ github.repository }}
+
       - name: Get All Repository Issues
         id: get_all_issues
         run: |
@@ -418,6 +426,8 @@ jobs:
           echo "$all_issue_numbers" | grep -v '^$' > /tmp/issue_numbers.txt
           total_issues=$(cat /tmp/issue_numbers.txt | wc -l)
           echo "Total open issues found: $total_issues"
+
+          echo "Last processed issue numbers: $(cat /tmp/last_processed_issue_number.txt)"
 
       - name: Process All Issues
         shell: bash
@@ -472,6 +482,14 @@ jobs:
                 break
               fi
               issue_number="${issue_numbers[$processed_count]}"
+
+              # Check if issue number is already in the last processed issue number file
+              grep -q "^$issue_number$" /tmp/last_processed_issue_number.txt
+              if [[ $? -eq 0 ]]; then
+                echo "Issue #$issue_number already processed, skipping..."
+                processed_count=$((processed_count + 1))
+                continue
+              fi
 
               echo "Group $group: Processing issue #$issue_number..."
 
@@ -666,6 +684,8 @@ jobs:
                 fi
               else
                 echo "Issue #$issue_number: Status='$STATUS_VALUE', Work Started='$WORK_STARTED_VALUE' - no update needed"
+                # Save last processed issue number to cache file
+                echo "$issue_number" >> /tmp/last_processed_issue_number.txt
               fi
 
 
