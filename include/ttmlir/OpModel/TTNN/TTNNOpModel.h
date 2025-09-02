@@ -351,11 +351,12 @@ struct OpModel<SoftmaxOp> {
   getOpConstraints(ttcore::GridAttr deviceGrid,
                    llvm::ArrayRef<int64_t> inputShape,
                    TTNNLayoutAttr inputLayout, const int dimArg,
-                   TTNNLayoutAttr outputLayout);
+                   bool numericStable, TTNNLayoutAttr outputLayout);
 
   static llvm::Expected<size_t> getOpRuntime(llvm::ArrayRef<int64_t> inputShape,
                                              TTNNLayoutAttr inputLayout,
                                              const int dimArg,
+                                             bool numericStable,
                                              TTNNLayoutAttr outputLayout);
 };
 
@@ -499,6 +500,22 @@ struct OpModel<MorehCumSumOp> {
   static llvm::Expected<size_t> getOpRuntime(llvm::ArrayRef<int64_t> inputShape,
                                              TTNNLayoutAttr inputLayout,
                                              const int64_t dim,
+                                             TTNNLayoutAttr outputLayout);
+};
+
+//===----------------------------------------------------------------------===//
+// ConcatenateHeadsOp
+//===----------------------------------------------------------------------===//
+
+template <>
+struct OpModel<ConcatenateHeadsOp> {
+  static llvm::Expected<OpConstraints>
+  getOpConstraints(ttcore::GridAttr deviceGrid,
+                   llvm::ArrayRef<int64_t> inputShape,
+                   TTNNLayoutAttr inputLayout, TTNNLayoutAttr outputLayout);
+
+  static llvm::Expected<size_t> getOpRuntime(llvm::ArrayRef<int64_t> inputShape,
+                                             TTNNLayoutAttr inputLayout,
                                              TTNNLayoutAttr outputLayout);
 };
 
@@ -798,6 +815,31 @@ struct OpModel<BatchNormOp> {
                std::optional<llvm::ArrayRef<int64_t>> biasShape,
                std::optional<TTNNLayoutAttr> biasLayout, llvm::APFloat epsilon,
                bool training, llvm::APFloat momentum,
+               TTNNLayoutAttr outputLayout);
+};
+
+//===----------------------------------------------------------------------===//
+// RMSNormOp
+//===----------------------------------------------------------------------===//
+
+template <>
+struct OpModel<RMSNormOp> {
+  static llvm::Expected<OpConstraints>
+  getOpConstraints(ttcore::GridAttr deviceGrid,
+                   llvm::ArrayRef<int64_t> inputShape,
+                   TTNNLayoutAttr inputLayout,
+                   std::optional<llvm::ArrayRef<int64_t>> weightShape,
+                   std::optional<TTNNLayoutAttr> weightLayout,
+                   std::optional<llvm::ArrayRef<int64_t>> biasShape,
+                   std::optional<TTNNLayoutAttr> biasLayout,
+                   llvm::APFloat epsilon, TTNNLayoutAttr outputLayout);
+
+  static llvm::Expected<size_t>
+  getOpRuntime(llvm::ArrayRef<int64_t> inputShape, TTNNLayoutAttr inputLayout,
+               std::optional<llvm::ArrayRef<int64_t>> weightShape,
+               std::optional<TTNNLayoutAttr> weightLayout,
+               std::optional<llvm::ArrayRef<int64_t>> biasShape,
+               std::optional<TTNNLayoutAttr> biasLayout, llvm::APFloat epsilon,
                TTNNLayoutAttr outputLayout);
 };
 
