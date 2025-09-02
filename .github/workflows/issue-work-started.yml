@@ -692,8 +692,10 @@ jobs:
                 fi
               else
                 echo "Issue #$issue_number: Status='$STATUS_VALUE', Work Started='$WORK_STARTED_VALUE' - no update needed"
-                # Save last processed issue number to cache file
-                echo "$issue_number" >> /tmp/last_processed_issue_number.txt
+                if [[ "$STATUS_VALUE" == "In Progress" ]]; then
+                  # Save last processed issue number to cache file
+                  echo "$issue_number" >> /tmp/last_processed_issue_number.txt
+                fi
               fi
 
 
@@ -740,4 +742,6 @@ jobs:
             wait < <(jobs -p) || exit 1
 
 
-          echo "Summary: Processed $processed_count issues, updated $updated_count Work Started fields"
+          # save unique sorted last processed issue numbers
+          cat /tmp/last_processed_issue_number.txt | sort | uniq > /tmp/last_processed_issue_number.txt
+          
