@@ -490,9 +490,9 @@ jobs:
               # Check if issue number is already in the last processed issue number file
               if [[ -f /tmp/last_processed_issue_number.txt ]]; then
                 set +e
-                grep -q "^$issue_number$" /tmp/last_processed_issue_number.txt
+                cache_issue_number=$(cat /tmp/last_processed_issue_number.txt | grep -oP "^$issue_number$")
                 set -e
-                if [[ $? -eq 0 ]]; then
+                if [[ "$cache_issue_number" == "$issue_number" ]]; then
                   echo "Issue #$issue_number already processed, skipping..."
                   processed_count=$((processed_count + 1))
                   continue
