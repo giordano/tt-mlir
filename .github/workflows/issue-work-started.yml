@@ -366,6 +366,8 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Restore last processed issue number
         id: cache-last-processed-issue-number
@@ -383,7 +385,7 @@ jobs:
       - name: Run bulk update
         run: |
           pip install -r ./.github/scripts/python/bulk_update_issues/requirements-bulk-update.txt
-          python /.github/scripts/python/bulk_update_issues/bulk_update_issues.py
+          python ./.github/scripts/python/bulk_update_issues/bulk_update_issues.py
           
       - name: Save last processed issue number
         id: cache-last-processed-issue-number-save
