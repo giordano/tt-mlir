@@ -364,85 +364,79 @@ class GitHubProjectUpdater:
             print_flush(f"   ❌ Error updating Work Started field for item {item_id}: {e}")
             return False
     
+    async def process_issue_with_infinite_retry(self, issue_number: int) -> None:
+        """Process a single issue with infinite retry until it succeeds."""
+        attempt = 0
+        
+        while True:
+            attempt += 1
+            
+            try:
+                await self.process_issue(issue_number)
+                return  # Success, exit the retry loop
+                
+            except Exception as e:
+                wait_time = min(30 + (attempt * 10), 300) + random.randint(5, 15)  # Cap at 5 minutes
+                print_flush(f"⚠️ Issue #{issue_number} failed (attempt #{attempt}): {e}")
+                print_flush(f"⏰ Retrying issue #{issue_number} in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+    
     async def process_issue(self, issue_number: int) -> None:
         """Process a single issue: check status and update Work Started if needed."""
         print_flush(f"🔄 Processing issue #{issue_number}...")
         
-        try:
-            # Step 1: Get issue details
-            debug_print(f"   📋 Getting issue details...")
-            issue_data = await asyncio.wait_for(
-                self.get_issue_details(issue_number), timeout=60.0
-            )
+        # Step 1: Get issue details
+        debug_print(f"   📋 Getting issue details...")
+        issue_data = await self.get_issue_details(issue_number)
+        
+        if not issue_data:
+            raise Exception(f"Failed to get issue #{issue_number} details")
             
-            if not issue_data:
-                print_flush(f"   ❌ Failed to get issue #{issue_number} details")
-                self.error_count += 1
-                return
-                
-            issue_id = issue_data.get("node_id")
-            if not issue_id:
-                print_flush(f"   ❌ No node_id found for issue #{issue_number}")
-                self.error_count += 1
-                return
-                
-            debug_print(f"   ✅ Got issue details (ID: {issue_id})")
+        issue_id = issue_data.get("node_id")
+        if not issue_id:
+            raise Exception(f"No node_id found for issue #{issue_number}")
             
-            # Step 2: Find project item ID
-            debug_print(f"   🔍 Finding project item...")
-            item_id = await asyncio.wait_for(
-                self.find_project_item_id(issue_id), timeout=60.0
-            )
-            
-            if not item_id:
-                print_flush(f"   ⚠️ Issue #{issue_number} not found in project, skipping")
-                self.processed_count += 1
-                return
-                
-            debug_print(f"   ✅ Found project item (ID: {item_id})")
-            
-            # Step 3: Get current field values
-            debug_print(f"   📊 Getting field values...")
-            field_values = await asyncio.wait_for(
-                self.get_issue_field_values(item_id), timeout=60.0
-            )
-            
-            if field_values is None:
-                print_flush(f"   ❌ Failed to get field values for issue #{issue_number}")
-                self.error_count += 1
-                return
-                
-            status = field_values.get("Status", "")
-            work_started = field_values.get("Work Started", "")
-            
-            print_flush(f"   📊 Status: '{status}', Work Started: '{work_started}'")
-            
-            # Step 4: Update Work Started if needed
-            if status == "In Progress" and not work_started:
-                debug_print(f"   🔧 Updating Work Started field...")
-                today = time.strftime("%Y-%m-%d")
-                
-                success = await asyncio.wait_for(
-                    self.update_work_started_field(item_id, today), timeout=60.0
-                )
-                
-                if success:
-                    self.updated_count += 1
-                    print_flush(f"   ✅ Issue #{issue_number} updated successfully")
-                else:
-                    self.error_count += 1
-                    print_flush(f"   ❌ Failed to update issue #{issue_number}")
-            else:
-                print_flush(f"   ⏭️ Issue #{issue_number} doesn't need update")
-                
+        debug_print(f"   ✅ Got issue details (ID: {issue_id})")
+        
+        # Step 2: Find project item ID
+        debug_print(f"   🔍 Finding project item...")
+        item_id = await self.find_project_item_id(issue_id)
+        
+        if not item_id:
+            print_flush(f"   ⚠️ Issue #{issue_number} not found in project, skipping")
             self.processed_count += 1
+            return
             
-        except asyncio.TimeoutError:
-            print_flush(f"   ⏰ Timeout processing issue #{issue_number}")
-            self.error_count += 1
-        except Exception as e:
-            print_flush(f"   ❌ Unexpected error processing issue #{issue_number}: {e}")
-            self.error_count += 1
+        debug_print(f"   ✅ Found project item (ID: {item_id})")
+        
+        # Step 3: Get current field values
+        debug_print(f"   📊 Getting field values...")
+        field_values = await self.get_issue_field_values(item_id)
+        
+        if field_values is None:
+            raise Exception(f"Failed to get field values for issue #{issue_number}")
+            
+        status = field_values.get("Status", "")
+        work_started = field_values.get("Work Started", "")
+        
+        print_flush(f"   📊 Status: '{status}', Work Started: '{work_started}'")
+        
+        # Step 4: Update Work Started if needed
+        if status == "In Progress" and not work_started:
+            debug_print(f"   🔧 Updating Work Started field...")
+            today = time.strftime("%Y-%m-%d")
+            
+            success = await self.update_work_started_field(item_id, today)
+            
+            if success:
+                self.updated_count += 1
+                print_flush(f"   ✅ Issue #{issue_number} updated successfully")
+            else:
+                raise Exception(f"Failed to update issue #{issue_number}")
+        else:
+            print_flush(f"   ⏭️ Issue #{issue_number} doesn't need update")
+            
+        self.processed_count += 1
 
 
 async def get_all_repository_issues(client: httpx.AsyncClient, token: str, repositories: List[str]) -> AsyncGenerator[tuple, None]:
@@ -607,7 +601,7 @@ async def main():
         print_flush(f"🔍 No cached issues found, fetching from repository...")
         repositories = [repository]
         
-        timeout = httpx.Timeout(60.0, connect=30.0)
+        timeout = httpx.Timeout(300.0, connect=60.0)  # Much higher timeouts to avoid network interference
         async with httpx.AsyncClient(timeout=timeout) as client:
             async for repo_name, repo_issue_numbers in get_all_repository_issues(client, token, repositories):
                 issue_numbers.extend(repo_issue_numbers)
@@ -645,7 +639,7 @@ async def main():
         
         async def process_with_semaphore(issue_number):
             async with semaphore:
-                await updater.process_issue(issue_number)
+                await updater.process_issue_with_infinite_retry(issue_number)
         
         tasks = [process_with_semaphore(issue_number) for issue_number in issue_numbers]
         
