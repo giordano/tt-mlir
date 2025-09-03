@@ -19,7 +19,7 @@ class GitHubProjectUpdater:
     """Handles bulk updates of GitHub project issue fields with rate limiting."""
     
     def __init__(self, token: str, repository: str, project_id: str, 
-                 work_started_field_id: str, max_concurrent: int = 5):
+                 work_started_field_id: str, client: httpx.AsyncClient, max_concurrent: int = 5):
         """
         Initialize the updater.
         
@@ -28,12 +28,14 @@ class GitHubProjectUpdater:
             repository: Repository in format "owner/repo"
             project_id: GitHub project v2 ID
             work_started_field_id: Field ID for Work Started field
+            client: httpx AsyncClient for making requests
             max_concurrent: Maximum concurrent requests (default: 5)
         """
         self.token = token
         self.repository = repository
         self.project_id = project_id
         self.work_started_field_id = work_started_field_id
+        self.client = client
         self.semaphore = asyncio.Semaphore(max_concurrent)
         
         self.headers = {
@@ -89,13 +91,11 @@ class GitHubProjectUpdater:
             
         return False
     
-    async def make_request_with_retry(self, client: httpx.AsyncClient, 
-                                    method: str, url: str, **kwargs) -> Optional[httpx.Response]:
+    async def make_request_with_retry(self, method: str, url: str, **kwargs) -> Optional[httpx.Response]:
         """
         Make HTTP request with automatic retry on rate limiting.
         
         Args:
-            client: httpx client
             method: HTTP method
             url: Request URL
             **kwargs: Additional request arguments
@@ -108,7 +108,7 @@ class GitHubProjectUpdater:
         
         while retry_count < max_retries:
             try:
-                response = await client.request(method, url, **kwargs)
+                response = await self.client.request(method, url, **kwargs)
                 
                 if await self.handle_rate_limit(response):
                     retry_count += 1
@@ -124,13 +124,11 @@ class GitHubProjectUpdater:
         print(f"Max retries exceeded for {method} {url}")
         return None
     
-    async def get_issue_details(self, client: httpx.AsyncClient, 
-                              issue_number: int) -> Optional[Dict[str, Any]]:
+    async def get_issue_details(self, issue_number: int) -> Optional[Dict[str, Any]]:
         """
         Get issue details including node_id from GitHub API.
         
         Args:
-            client: httpx client
             issue_number: Issue number to fetch
             
         Returns:
@@ -139,7 +137,7 @@ class GitHubProjectUpdater:
         url = f"{self.github_api_url}/repos/{self.repository}/issues/{issue_number}"
         
         response = await self.make_request_with_retry(
-            client, "GET", url, headers=self.headers
+            "GET", url, headers=self.headers
         )
         
         if not response or response.status_code != 200:
@@ -152,13 +150,11 @@ class GitHubProjectUpdater:
             print(f"Failed to parse issue #{issue_number} JSON: {e}")
             return None
     
-    async def find_project_item_id(self, client: httpx.AsyncClient, 
-                                 issue_id: str) -> Optional[str]:
+    async def find_project_item_id(self, issue_id: str) -> Optional[str]:
         """
         Find project item ID for a given issue using GraphQL pagination.
         
         Args:
-            client: httpx client
             issue_id: GitHub issue node ID
             
         Returns:
@@ -215,7 +211,7 @@ class GitHubProjectUpdater:
             }
             
             response = await self.make_request_with_retry(
-                client, "POST", self.graphql_url, 
+                "POST", self.graphql_url, 
                 headers=self.headers, json=payload
             )
             
@@ -248,13 +244,11 @@ class GitHubProjectUpdater:
         
         return None
     
-    async def get_issue_field_values(self, client: httpx.AsyncClient, 
-                                   item_id: str) -> Optional[Dict[str, Any]]:
+    async def get_issue_field_values(self, item_id: str) -> Optional[Dict[str, Any]]:
         """
         Get issue field values including Status and Work Started.
         
         Args:
-            client: httpx client
             item_id: Project item ID
             
         Returns:
@@ -299,7 +293,7 @@ class GitHubProjectUpdater:
         }
         
         response = await self.make_request_with_retry(
-            client, "POST", self.graphql_url,
+            "POST", self.graphql_url,
             headers=self.headers, json=payload
         )
         
@@ -319,13 +313,11 @@ class GitHubProjectUpdater:
             print(f"Error parsing field values response: {e}")
             return None
     
-    async def update_work_started_field(self, client: httpx.AsyncClient,
-                                      item_id: str, date: str) -> bool:
+    async def update_work_started_field(self, item_id: str, date: str) -> bool:
         """
         Update the Work Started field for a project item.
         
         Args:
-            client: httpx client
             item_id: Project item ID
             date: Date to set in YYYY-MM-DD format
             
@@ -348,7 +340,7 @@ class GitHubProjectUpdater:
         payload = {"query": mutation}
         
         response = await self.make_request_with_retry(
-            client, "POST", self.graphql_url,
+            "POST", self.graphql_url,
             headers=self.headers, json=payload
         )
         
@@ -368,14 +360,11 @@ class GitHubProjectUpdater:
             print(f"Error parsing update response: {e}")
             return False
     
-    async def process_issue(self, client: httpx.AsyncClient, 
-                          repo: str,
-                          issue_number: int) -> None:
+    async def process_issue(self, issue_number: int) -> None:
         """
         Process a single issue: check status and update Work Started if needed.
         
         Args:
-            client: httpx client
             issue_number: Issue number to process
         """
         async with self.semaphore:
@@ -383,7 +372,7 @@ class GitHubProjectUpdater:
                 print(f"Processing issue #{issue_number}...")
                 
                 # Get issue details
-                issue_details = await self.get_issue_details(client, issue_number)
+                issue_details = await self.get_issue_details(issue_number)
                 if not issue_details:
                     print(f"Could not get issue #{issue_number} details, skipping")
                     self.error_count += 1
@@ -396,14 +385,14 @@ class GitHubProjectUpdater:
                     return
                 
                 # Find project item ID
-                item_id = await self.find_project_item_id(client, issue_id)
+                item_id = await self.find_project_item_id(issue_id)
                 if not item_id:
                     print(f"Issue #{issue_number} not found in project, skipping")
                     self.processed_count += 1
                     return
                 
                 # Get field values
-                field_data = await self.get_issue_field_values(client, item_id)
+                field_data = await self.get_issue_field_values(item_id)
                 if not field_data:
                     print(f"Could not get field values for issue #{issue_number}")
                     self.error_count += 1
@@ -446,7 +435,7 @@ class GitHubProjectUpdater:
                         print(f"Using current date: {work_started_date}")
                     
                     # Update the field
-                    if await self.update_work_started_field(client, item_id, work_started_date):
+                    if await self.update_work_started_field(item_id, work_started_date):
                         print(f"✅ Updated Work Started for issue #{issue_number} to {work_started_date}")
                         self.updated_count += 1
                     else:
@@ -464,34 +453,6 @@ class GitHubProjectUpdater:
                 print(f"Error processing issue #{issue_number}: {e}")
                 self.error_count += 1
     
-    async def run_bulk_update(self, issue_numbers: List[int]) -> None:
-        """
-        Run bulk update for all provided issue numbers.
-        
-        Args:
-            issue_numbers: List of issue numbers to process
-        """
-        
-        start_time = time.time()
-        
-        # Use httpx with connection pooling for better performance
-        async with httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            timeout=httpx.Timeout(30.0)
-        ) as client:
-            
-            # Create tasks for all issues
-            tasks = [
-                self.process_issue(client, repo, issue_number) 
-                for issue_number in issue_numbers
-            ]
-            
-            # Run all tasks concurrently (semaphore controls actual concurrency)
-            await asyncio.gather(*tasks, return_exceptions=True)
-        
-        end_time = time.time()
-        duration = end_time - start_time
-
 
 async def get_all_repository_issues(client: httpx.AsyncClient, 
                                   token: str, 
@@ -592,22 +553,34 @@ async def main():
         print("Error: GITHUB_TOKEN environment variable is required")
         return    
 
-    try:
-        async for repo, issue_numbers in get_all_repository_issues(client, token, repositories):
-            # Create updater and run
-            updater = GitHubProjectUpdater(
-                token=token,
-                repository=repo,
-                project_id=project_id,
-                work_started_field_id=work_started_field_id,
-                max_concurrent=max_concurrent
-            )
-            
-            await updater.run_bulk_update(issue_numbers)
+    # Use httpx with connection pooling for better performance
+    async with httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        timeout=httpx.Timeout(30.0)
+    ) as client:
+        try:
+            async for repo, issue_numbers in get_all_repository_issues(client, token, repositories):
+                # Create updater and run
+                updater = GitHubProjectUpdater(
+                    token=token,
+                    repository=repo,
+                    project_id=project_id,
+                    work_started_field_id=work_started_field_id,
+                    client=client,
+                    max_concurrent=max_concurrent
+                )
+                # Create tasks for all issues
+                tasks = [
+                    self.process_issue(issue_number) 
+                    for issue_number in issue_numbers
+                ]
+                
+                # Run all tasks concurrently (semaphore controls actual concurrency)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-    finally:
-        with open("/tmp/last_processed_issue_number.txt", "w") as f:
-            json.dump(last_processed_issue_number, f)
+        finally:
+            with open("/tmp/last_processed_issue_number.txt", "w") as f:
+                json.dump(last_processed_issue_number, f)
 
 
 if __name__ == "__main__":
