@@ -462,17 +462,17 @@ class GitHubProjectUpdater:
 
 async def get_all_repository_issues(client: httpx.AsyncClient, 
                                   token: str, 
-                                  repository: List[str]) -> AsyncGenerator[int, None]:
+                                  repository: List[str]) -> AsyncGenerator[tuple, None]:
     """
-    Async generator that fetches all open issues from a repository with pagination.
+    Async generator that fetches all open issues from repositories with pagination.
     
     Args:
         client: httpx client
         token: GitHub token
-        repository: Repository in format "owner/repo"
+        repository: List of repositories in format ["owner/repo", ...]
         
     Yields:
-        Issue numbers as integers
+        Tuples of (repository_name, list_of_issue_numbers)
     """
     for repo in repository:
         headers = {
@@ -483,13 +483,13 @@ async def get_all_repository_issues(client: httpx.AsyncClient,
         page = 1
         max_pages = 50  # Safety check to prevent infinite loops
         
-        print(f"Fetching all open issues from repository {repository}...")
+        print(f"Fetching all open issues from repository {repo}...")
         
         while page <= max_pages:
             print(f"Fetching page {page} of issues...")
             
             # Build URL with pagination parameters
-            url = f"https://api.github.com/repos/{repository}/issues"
+            url = f"https://api.github.com/repos/{repo}/issues"
             params = {
                 "state": "open",
                 "per_page": 100,
@@ -500,34 +500,34 @@ async def get_all_repository_issues(client: httpx.AsyncClient,
                 response = await client.get(url, headers=headers, params=params)
                 
                 if response.status_code != 200:
-                    print(f"Error fetching issues page {page}: {response.status_code}")
+                    print(f"Error fetching issues page {page} for {repo}: {response.status_code}")
                     break
                     
                 issues_data = response.json()
                 page_issue_count = len(issues_data)
                 
                 if page_issue_count == 0:
-                    print(f"No more issues found on page {page}")
+                    print(f"No more issues found on page {page} for {repo}")
                     break
                 
-                print(f"Found {page_issue_count} issues on page {page}")
+                print(f"Found {page_issue_count} issues on page {page} for {repo}")
                 
                 # Yield each issue number from this page
-                yield repo, [issue.get("number") for issue in issues_data]
+                yield repo, [issue.get("number") for issue in issues_data if issue.get("number")]
                 
                 # Check if we got less than 100 issues (last page)
                 if page_issue_count < 100:
-                    print("Last page reached (less than 100 issues)")
+                    print(f"Last page reached for {repo} (less than 100 issues)")
                     break
                     
                 page += 1
                 
             except Exception as e:
-                print(f"Error fetching issues page {page}: {e}")
+                print(f"Error fetching issues page {page} for {repo}: {e}")
                 break
     
-    if page > max_pages:
-        print(f"Reached maximum pages ({max_pages}). Stopping to prevent infinite loop.")
+        if page > max_pages:
+            print(f"Reached maximum pages ({max_pages}) for {repo}. Stopping to prevent infinite loop.")
 
 
 
