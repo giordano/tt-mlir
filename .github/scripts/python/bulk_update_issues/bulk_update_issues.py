@@ -379,6 +379,8 @@ class GitHubProjectUpdater:
             status_info = {}
             work_started_info = {}
             
+            debug_print(f"   🔍 Raw field values count: {len(field_values)}")
+            
             for field_value in field_values:
                 if not field_value:
                     continue
@@ -387,26 +389,44 @@ class GitHubProjectUpdater:
                 field_name = field_info.get("name")
                 field_id = field_info.get("id")
                 
+                debug_print(f"   🔍 Field: '{field_name}' (ID: {field_id}) = {field_value}")
+                
                 if field_name:
                     if "name" in field_value:  # Single select field (Status)
                         status_value = field_value["name"]
+                        debug_print(f"   🔍 Found single select field '{field_name}' = '{status_value}'")
+                        
+                        # Store all single select fields, identify Status field
+                        fields[field_name] = status_value
+                        
                         # Check if this is a known Status value (matching workflow)
                         if status_value in ["In Progress", "Assigned", "Screen", "Blocked", "Done", "In Review"]:
-                            fields[field_name] = status_value
                             status_info = {
                                 "value": status_value,
                                 "updatedAt": field_value.get("updatedAt"),
                                 "fieldId": field_id
                             }
+                            debug_print(f"   ✅ Identified as Status field: '{status_value}'")
+                            
                     elif "date" in field_value:  # Date field (Work Started)
+                        date_value = field_value["date"]
+                        debug_print(f"   🔍 Found date field '{field_name}' = '{date_value}'")
+                        
+                        # Store all date fields
+                        fields[field_name] = date_value
+                        
                         # Check both field name and field ID (matching workflow)
                         if field_name == "Work Started" or field_id == self.work_started_field_id:
-                            fields[field_name] = field_value["date"]
                             work_started_info = {
-                                "value": field_value["date"],
+                                "value": date_value,
                                 "updatedAt": field_value.get("updatedAt"),
                                 "fieldId": field_id
                             }
+                            debug_print(f"   ✅ Identified as Work Started field: '{date_value}'")
+            
+            debug_print(f"   📊 Extracted fields: {fields}")
+            debug_print(f"   📊 Status info: {status_info}")
+            debug_print(f"   📊 Work Started info: {work_started_info}")
             
             # Add metadata for date calculation logic
             fields["_status_info"] = status_info
@@ -516,12 +536,38 @@ class GitHubProjectUpdater:
         if field_values is None:
             raise Exception(f"Failed to get field values for issue #{issue_number}")
             
-        status = field_values.get("Status", "")
-        work_started = field_values.get("Work Started", "")
+        # Extract Status - try multiple approaches (matching workflow logic)
+        status = ""
+        work_started = ""
+        
+        # First try by exact field name
+        if "Status" in field_values:
+            status = field_values["Status"]
+        else:
+            # Fallback: find any field with a known status value (matching workflow)
+            for field_name, field_value in field_values.items():
+                if field_name.startswith("_"):  # Skip metadata fields
+                    continue
+                if field_value in ["In Progress", "Assigned", "Screen", "Blocked", "Done", "In Review"]:
+                    status = field_value
+                    debug_print(f"   🔍 Found status in field '{field_name}': '{status}'")
+                    break
+        
+        # Extract Work Started
+        if "Work Started" in field_values:
+            work_started = field_values["Work Started"]
+        else:
+            # Look for any field that might be Work Started by field ID
+            ws_info = field_values.get("_work_started_info", {})
+            work_started = ws_info.get("value", "")
+        
+        # Get metadata for timestamp logic
         status_info = field_values.get("_status_info", {})
         work_started_info = field_values.get("_work_started_info", {})
         
         print_flush(f"   📊 Status: '{status}', Work Started: '{work_started}'")
+        debug_print(f"   📊 Using status_info: {status_info}")
+        debug_print(f"   📊 Using work_started_info: {work_started_info}")
         
         # Step 4: Update Work Started if needed (matching workflow logic exactly)
         # Condition: Status is "In Progress" AND Work Started is empty/null
@@ -544,6 +590,7 @@ class GitHubProjectUpdater:
             if success:
                 self.updated_count += 1
                 print_flush(f"   ✅ Updated Work Started for issue #{issue_number} to {work_started_date} (date when status changed)")
+                processed_issue_numbers[issue_number] = self.repository
             else:
                 raise Exception(f"Failed to update issue #{issue_number}")
         else:
@@ -551,8 +598,6 @@ class GitHubProjectUpdater:
             
         self.processed_count += 1
         
-        # Add rate limiting delay like workflow (1 second between issues)
-        await asyncio.sleep(1)
 
 
 async def get_all_repository_issues(client: httpx.AsyncClient, token: str, repositories: List[str]) -> AsyncGenerator[tuple, None]:
@@ -705,9 +750,9 @@ async def main():
             print_flush(f"✅ Loaded {len(processed_issue_numbers)} processed issue numbers from cache")
         except Exception as e:
             print_flush(f"⚠️ Error reading cache file: {e}")
-            processed_issue_numbers = []
+            processed_issue_numbers = {}
     else:
-        processed_issue_numbers = []
+        processed_issue_numbers = {}
     
     
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -721,7 +766,7 @@ async def main():
             print_flush(f"📊 Processing {len(repo_issue_numbers)} issues from repository: {repo_name}")
             
             # Filter out already processed issues
-            issues_to_process = [issue for issue in repo_issue_numbers if issue not in processed_issue_numbers]
+            issues_to_process = [issue for issue in repo_issue_numbers if processed_issue_numbers.get(issue, None) != repo_name]
             if len(issues_to_process) != len(repo_issue_numbers):
                 print_flush(f"📂 Skipping {len(repo_issue_numbers) - len(issues_to_process)} already processed issues")
             
