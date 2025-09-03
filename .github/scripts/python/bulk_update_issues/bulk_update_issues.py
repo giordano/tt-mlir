@@ -21,6 +21,28 @@ def print_flush(*args, **kwargs):
     print(*args, **kwargs)
     sys.stdout.flush()
 
+
+async def track_progress(updater, total_issues: int, start_time: float):
+    """Track and report progress during concurrent processing."""
+    while True:
+        await asyncio.sleep(30)  # Report progress every 30 seconds
+        elapsed = time.time() - start_time
+        processed = updater.processed_count + updater.error_count
+        
+        if processed > 0:
+            rate = processed / elapsed
+            estimated_remaining = (total_issues - processed) / rate if rate > 0 else 0
+            print_flush(f"📊 Progress: {processed}/{total_issues} issues processed "
+                       f"({processed/total_issues*100:.1f}%) - "
+                       f"Rate: {rate:.1f}/sec - "
+                       f"ETA: {estimated_remaining/60:.1f}min - "
+                       f"✅{updater.processed_count} ❌{updater.error_count} 🔄{updater.updated_count}")
+        else:
+            print_flush(f"📊 Progress: Waiting for first issue to complete... ({elapsed:.1f}s elapsed)")
+            
+        if processed >= total_issues:
+            break
+
 class GitHubProjectUpdater:
     """Handles bulk updates of GitHub project issue fields with rate limiting."""
     
@@ -430,39 +452,69 @@ class GitHubProjectUpdater:
 
         repo = last_processed_issue_number.get(issue_number)
         if repo == self.repository:
-            print(f"⏭️  Issue #{issue_number} already processed, skipping...")
+            print_flush(f"⏭️  Issue #{issue_number} already processed, skipping...")
             return
         
         async with self.semaphore:
             try:
-                print(f"🔄 Processing issue #{issue_number}...")
+                print_flush(f"🔄 Processing issue #{issue_number}...")
                 
                 # Get issue details
-                issue_details = await self.get_issue_details(issue_number)
+                print_flush(f"   🔍 Getting details for issue #{issue_number}...")
+                try:
+                    issue_details = await asyncio.wait_for(
+                        self.get_issue_details(issue_number), timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    print_flush(f"   ⏰ Timeout getting details for issue #{issue_number}")
+                    self.error_count += 1
+                    return
                 if not issue_details:
-                    print(f"Could not get issue #{issue_number} details, skipping")
+                    print_flush(f"   ❌ Could not get issue #{issue_number} details, skipping")
                     self.error_count += 1
                     return
                 
                 issue_id = issue_details.get("node_id")
                 if not issue_id:
-                    print(f"Could not get issue ID for #{issue_number}, skipping")
+                    print_flush(f"   ❌ Could not get issue ID for #{issue_number}, skipping")
                     self.error_count += 1
                     return
                 
+                print_flush(f"   ✅ Got issue details for #{issue_number} (ID: {issue_id[:20]}...)")
+                
                 # Find project item ID
-                item_id = await self.find_project_item_id(issue_id)
+                print_flush(f"   🔍 Finding project item for issue #{issue_number}...")
+                try:
+                    item_id = await asyncio.wait_for(
+                        self.find_project_item_id(issue_id), timeout=45.0
+                    )
+                except asyncio.TimeoutError:
+                    print_flush(f"   ⏰ Timeout finding project item for issue #{issue_number}")
+                    self.error_count += 1
+                    return
                 if not item_id:
-                    print(f"Issue #{issue_number} not found in project, skipping")
+                    print_flush(f"   ⚠️  Issue #{issue_number} not found in project, skipping")
                     self.processed_count += 1
                     return
                 
+                print_flush(f"   ✅ Found project item for #{issue_number} (Item ID: {item_id[:20]}...)")
+                
                 # Get field values
-                field_data = await self.get_issue_field_values(item_id)
-                if not field_data:
-                    print(f"Could not get field values for issue #{issue_number}")
+                print_flush(f"   🔍 Getting field values for issue #{issue_number}...")
+                try:
+                    field_data = await asyncio.wait_for(
+                        self.get_issue_field_values(item_id), timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    print_flush(f"   ⏰ Timeout getting field values for issue #{issue_number}")
                     self.error_count += 1
                     return
+                if not field_data:
+                    print_flush(f"   ❌ Could not get field values for issue #{issue_number}")
+                    self.error_count += 1
+                    return
+                
+                print_flush(f"   ✅ Got field values for issue #{issue_number}")
                 
                 # Parse field values
                 field_nodes = field_data.get("data", {}).get("node", {}).get("fieldValues", {}).get("nodes", [])
@@ -485,38 +537,51 @@ class GitHubProjectUpdater:
                         field.get("name") == "Work Started"):
                         work_started_value = node.get("date")
                 
+                print_flush(f"   📋 Issue #{issue_number}: Status='{status_value}', Work Started='{work_started_value}'")
+                
                 # Check if we need to update
                 if (status_value == "In Progress" and 
                     (not work_started_value or work_started_value == "null")):
                     
-                    print(f"Issue #{issue_number} has Status='In Progress' but no Work Started date - updating...")
+                    print_flush(f"   🔄 Issue #{issue_number} needs Work Started update...")
                     
                     # Determine the date to use
                     if status_updated_at and status_updated_at != "null":
                         work_started_date = status_updated_at.split('T')[0]
-                        print(f"Using status change date: {work_started_date}")
+                        print_flush(f"   📅 Using status change date: {work_started_date}")
                     else:
                         from datetime import date
                         work_started_date = date.today().strftime('%Y-%m-%d')
-                        print(f"Using current date: {work_started_date}")
+                        print_flush(f"   📅 Using current date: {work_started_date}")
                     
                     # Update the field
-                    if await self.update_work_started_field(item_id, work_started_date):
-                        print(f"✅ Updated Work Started for issue #{issue_number} to {work_started_date}")
+                    print_flush(f"   🔍 Updating Work Started field for issue #{issue_number}...")
+                    try:
+                        update_result = await asyncio.wait_for(
+                            self.update_work_started_field(item_id, work_started_date), timeout=30.0
+                        )
+                    except asyncio.TimeoutError:
+                        print_flush(f"   ⏰ Timeout updating field for issue #{issue_number}")
+                        self.error_count += 1
+                        return
+                    
+                    if update_result:
+                        print_flush(f"   ✅ Updated Work Started for issue #{issue_number} to {work_started_date}")
                         self.updated_count += 1
                     else:
-                        print(f"❌ Failed to update Work Started for issue #{issue_number}")
+                        print_flush(f"   ❌ Failed to update Work Started for issue #{issue_number}")
                         self.error_count += 1
                 else:
-                    print(f"Issue #{issue_number}: Status='{status_value}', Work Started='{work_started_value}' - no update needed")
+                    print_flush(f"   ⏭️  Issue #{issue_number}: No update needed")
                     if status_value == "In Progress":
-                        print(f"Saving last processed issue number {issue_number} to cache file")
+                        print_flush(f"   💾 Caching processed issue #{issue_number}")
                         last_processed_issue_number[issue_number] = self.repository
                 
+                print_flush(f"   ✅ Completed processing issue #{issue_number}")
                 self.processed_count += 1
                 
             except Exception as e:
-                print(f"Error processing issue #{issue_number}: {e}")
+                print_flush(f"   ❌ Error processing issue #{issue_number}: {e}")
                 self.error_count += 1
     
 
@@ -660,8 +725,18 @@ async def main():
                 print_flush(f"⚡ Starting concurrent processing with max {max_concurrent} simultaneous requests...")
                 start_time = time.time()
                 
+                # Add progress tracking
+                progress_task = asyncio.create_task(track_progress(updater, len(issue_numbers), start_time))
+                
                 # Run all tasks concurrently (semaphore controls actual concurrency)
-                await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
                 
                 end_time = time.time()
                 duration = end_time - start_time
