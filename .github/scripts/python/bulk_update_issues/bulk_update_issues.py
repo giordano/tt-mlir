@@ -367,6 +367,12 @@ class GitHubProjectUpdater:
         Args:
             issue_number: Issue number to process
         """
+
+        repo = last_processed_issue_number.get(issue_number)
+        if repo == self.repository:
+            print(f"Issue #{issue_number} for repository {self.repository} already processed, skipping...")
+            return
+        
         async with self.semaphore:
             try:
                 print(f"Processing issue #{issue_number}...")
@@ -445,7 +451,7 @@ class GitHubProjectUpdater:
                     print(f"Issue #{issue_number}: Status='{status_value}', Work Started='{work_started_value}' - no update needed")
                     if status_value == "In Progress":
                         print(f"Saving last processed issue number {issue_number} to cache file")
-                        last_processed_issue_number[self.repository] = issue_number
+                        last_processed_issue_number[issue_number] = self.repository
                 
                 self.processed_count += 1
                 
