@@ -3,13 +3,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+#include "ttmlir/Dialect/TTCore/IR/TTCoreTraits.h"
 #include "ttmlir/Dialect/TTNN/IR/TTNNOpsResources.h"
 
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTCore/IR/Utils.h"
 #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNOpsTypes.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNTensorSpecInterface.h"
 #include "ttmlir/Dialect/TTNN/Types/Types.h"
+#include "ttmlir/Dialect/TTNN/Utils/TransformUtils.h"
 #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 #include "ttmlir/Dialect/TTNN/Utils/VerificationUtils.h"
 #include "ttmlir/Utils.h"
@@ -19,6 +23,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
+#include "mlir/IR/BuiltinTypes.h"
 #include <cstdint>
 #include <numeric>
 #include <optional>
@@ -1790,6 +1795,89 @@ mlir::OpFoldResult ttnn::ToLayoutOp::fold(FoldAdaptor adaptor) {
   }
 
   return nullptr;
+}
+
+// ToLayoutOp canonicalize method
+::llvm::LogicalResult
+mlir::tt::ttnn::ToLayoutOp::canonicalize(mlir::tt::ttnn::ToLayoutOp toLayoutOp,
+                                         mlir::PatternRewriter &rewriter) {
+  Operation *creationOp = toLayoutOp.getInput().getDefiningOp();
+  if (!creationOp ||
+      !creationOp->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>()) {
+    return failure();
+  }
+
+  auto ttnnLayoutAttr =
+      mlir::dyn_cast<TTNNLayoutAttr>(toLayoutOp.getType().getEncoding());
+  if (!ttnnLayoutAttr) {
+    return failure();
+  }
+
+  ttcore::DataTypeAttr targetDataTypeAttr = toLayoutOp.getDtypeAttr();
+  LayoutAttr targetLayoutAttr = toLayoutOp.getLayoutAttr();
+  MemoryConfigAttr targetMemoryConfigAttr = toLayoutOp.getMemoryConfigAttr();
+
+  // If the to layout op tends to move the tensor to host, we can't merge it
+  // into creation op if creation op doesn't support execution on host. For
+  // example Rand and Empty op can only work on device.
+  if (!creationOp->hasTrait<CanExecuteOnHostTrait>() &&
+      (!targetMemoryConfigAttr ||
+       isSystemBufferType(targetMemoryConfigAttr.getBufferType().getValue()))) {
+    return failure();
+  }
+
+  auto tensorSpecOp = mlir::cast<TTNNTensorSpecInterface>(creationOp);
+  rewriter.startOpModification(tensorSpecOp);
+
+  tensorSpecOp.setDtypeAttr(targetDataTypeAttr);
+  tensorSpecOp.setLayoutAttr(targetLayoutAttr);
+  tensorSpecOp.setMemoryConfigAttr(targetMemoryConfigAttr);
+
+  BufferTypeAttr newBufferType = nullptr;
+  if (tensorSpecOp.getMemoryConfigAttr()) {
+    newBufferType = tensorSpecOp.getMemoryConfigAttr().getBufferType();
+  }
+
+  // If the new buffer type is a device buffer type, we need to insert a device
+  // operand.
+  if (newBufferType && isDeviceBufferType(newBufferType.getValue())) {
+    bool deviceExist = false;
+    for (unsigned i = 0; i < tensorSpecOp->getNumOperands(); ++i) {
+      if (mlir::isa<mlir::tt::ttnn::DeviceType>(
+              tensorSpecOp->getOperand(i).getType())) {
+        deviceExist = true;
+        break;
+      }
+    }
+
+    if (!deviceExist) {
+      tensorSpecOp->insertOperands(
+          0, {utils::getOrInsertDevice(rewriter, toLayoutOp)});
+    }
+  } else if (isSystemBufferType(newBufferType.getValue())) {
+    // If the new buffer type is a system buffer type, we need to remove device
+    // operands.
+    for (unsigned i = 0; i < tensorSpecOp->getNumOperands(); ++i) {
+      if (mlir::isa<mlir::tt::ttnn::DeviceType>(
+              tensorSpecOp->getOperand(i).getType())) {
+        tensorSpecOp->eraseOperand(i);
+        break;
+      }
+    }
+  }
+
+  // Update the tensor ranked type of creation op with the new layout and new
+  // data type
+  tensorSpecOp->getResult(0).setType(
+      RankedTensorType::Builder(
+          mlir::cast<RankedTensorType>(creationOp->getResult(0).getType()))
+          .setEncoding(ttnnLayoutAttr)
+          .setElementType(ttnnLayoutAttr.getScalarElementType()));
+
+  rewriter.finalizeOpModification(tensorSpecOp);
+  rewriter.replaceAllOpUsesWith(toLayoutOp, tensorSpecOp);
+  rewriter.eraseOp(toLayoutOp);
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

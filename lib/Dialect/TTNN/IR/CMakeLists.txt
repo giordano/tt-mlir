@@ -4,6 +4,7 @@ add_mlir_dialect_library(MLIRTTNNDialect
         TTNNOps.cpp
         TTNNOpModelInterface.cpp
         TTNNOpsTypes.cpp
+        TTNNTensorSpecInterface.cpp
         TTNNWorkaroundInterface.cpp
         TTNNWorkaroundsPass.cpp
 
