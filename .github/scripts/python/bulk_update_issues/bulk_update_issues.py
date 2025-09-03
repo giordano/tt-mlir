@@ -6,6 +6,7 @@ Converts the bash run_bulk_update function to Python using asyncio and httpx.
 
 import asyncio
 import json
+import os
 import random
 import sys
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, AsyncGenerator
 
 import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 last_processed_issue_number = {}
 
@@ -43,328 +45,154 @@ async def track_progress(updater, total_issues: int, start_time: float):
         if processed >= total_issues:
             break
 
+
 class GitHubProjectUpdater:
     """Handles bulk updates of GitHub project issue fields with rate limiting."""
     
     def __init__(self, token: str, repository: str, project_id: str, 
                  work_started_field_id: str, client: httpx.AsyncClient, max_concurrent: int = 5):
-        """
-        Initialize the updater.
-        
-        Args:
-            token: GitHub token with project permissions
-            repository: Repository in format "owner/repo"
-            project_id: GitHub project v2 ID
-            work_started_field_id: Field ID for Work Started field
-            client: httpx AsyncClient for making requests
-            max_concurrent: Maximum concurrent requests (default: 5)
-        """
         self.token = token
         self.repository = repository
         self.project_id = project_id
         self.work_started_field_id = work_started_field_id
         self.client = client
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.max_concurrent = max_concurrent
         
-        self.headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-        
+        # API endpoints
         self.github_api_url = "https://api.github.com"
-        self.graphql_url = "https://api.github.com/graphql"
+        self.graphql_url = f"{self.github_api_url}/graphql"
+        
+        # Headers
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
         
         # Statistics
         self.processed_count = 0
         self.updated_count = 0
         self.error_count = 0
         
-    def _handle_graphql_errors(self, errors, context: str = "GraphQL operation") -> bool:
-        """
-        Handle GraphQL errors with specific permission error guidance.
+    @retry(
+        stop=stop_after_attempt(10), 
+        wait=wait_exponential(multiplier=1, min=30, max=300),
+        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError))
+    )
+    async def make_api_request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Make API request with automatic retry using tenacity."""
+        print_flush(f"   🌐 Making {method} request to {url.replace(self.github_api_url, 'GitHub API')}")
         
-        Args:
-            errors: List of GraphQL errors
-            context: Context of where the error occurred
-            
-        Returns:
-            True if this is a recoverable error, False if it's a fatal permission error
-        """
-        print(f"GraphQL error in {context}: {errors}")
+        response = await self.client.request(method, url, **kwargs)
         
-        # Check for permission issues
-        for error in errors:
-            if error.get('type') == 'FORBIDDEN':
-                print("\n❌ PERMISSION ERROR: GitHub token doesn't have project access.")
-                print("💡 SOLUTIONS:")
-                print("   1. Use a Personal Access Token (PAT) instead of GITHUB_TOKEN")
-                print("   2. Ensure token has 'project' and 'repo' scopes")
-                print("   3. Add token owner as project collaborator")
-                print("   4. In GitHub Actions, use secrets.TT_FORGE_PROJECT\n")
-                return False  # Fatal permission error
-                
-        return True  # Other errors might be recoverable
-        
-    async def handle_rate_limit(self, response: httpx.Response) -> bool:
-        """
-        Handle GitHub API rate limiting with exponential backoff.
-        
-        Args:
-            response: HTTP response to check for rate limiting
-            
-        Returns:
-            True if should retry, False if no rate limiting detected
-        """
+        # Check for rate limiting
         if response.status_code == 403:
             try:
                 error_data = response.json()
                 if "API rate limit exceeded" in str(error_data):
-                    # Exponential backoff with jitter (120-180 seconds base)
-                    base_sleep = random.randint(120, 180)
-                    # Add exponential component based on current time
-                    exp_factor = min(2 ** (self.error_count % 4), 8)
-                    sleep_time = base_sleep * exp_factor + random.randint(0, 30)
-                    
-                    print_flush(f"🛑 RATE LIMITED (403): Sleeping for {sleep_time} seconds...")
-                    print_flush(f"⏰ Will resume at approximately {time.strftime('%H:%M:%S', time.localtime(time.time() + sleep_time))}")
-                    
-                    # Add periodic updates during long sleeps
-                    for i in range(0, sleep_time, 30):
-                        remaining = sleep_time - i
-                        if remaining > 30:
-                            await asyncio.sleep(30)
-                            print_flush(f"💤 Still waiting... {remaining - 30} seconds remaining")
-                        else:
-                            await asyncio.sleep(remaining)
-                            break
-                    
-                    print_flush("⚡ Resuming after rate limit...")
-                    return True
+                    print_flush(f"🛑 Rate limited (403): {error_data}")
+                    response.raise_for_status()  # This will trigger retry
             except Exception:
                 pass
                 
         if response.status_code == 429:
-            # Handle retry-after header if present
-            retry_after = response.headers.get('retry-after')
-            if retry_after:
-                sleep_time = int(retry_after) + random.randint(10, 30)
-                print_flush(f"🛑 RATE LIMITED (429): Server requested {retry_after}s wait, adding buffer -> {sleep_time}s")
-            else:
-                sleep_time = random.randint(60, 120)
-                print_flush(f"🛑 RATE LIMITED (429): No retry-after header, using random backoff -> {sleep_time}s")
+            print_flush(f"🛑 Rate limited (429): {response.headers.get('retry-after', 'unknown')} seconds")
+            response.raise_for_status()  # This will trigger retry
             
-            print_flush(f"⏰ Will resume at approximately {time.strftime('%H:%M:%S', time.localtime(time.time() + sleep_time))}")
+        # Check for other HTTP errors
+        if response.status_code >= 400:
+            print_flush(f"❌ HTTP {response.status_code}: {response.text}")
+            response.raise_for_status()  # This will trigger retry for 4xx/5xx
             
-            # Add periodic updates during sleeps
-            for i in range(0, sleep_time, 15):
-                remaining = sleep_time - i
-                if remaining > 15:
-                    await asyncio.sleep(15)
-                    print_flush(f"💤 Rate limit wait... {remaining - 15} seconds remaining")
-                else:
-                    await asyncio.sleep(remaining)
-                    break
-            
-            print_flush("⚡ Resuming after rate limit...")
-            return True
-            
-        return False
-    
-    async def make_request_with_retry(self, method: str, url: str, **kwargs) -> Optional[httpx.Response]:
-        """
-        Make HTTP request with automatic retry on rate limiting.
-        
-        Args:
-            method: HTTP method
-            url: Request URL
-            **kwargs: Additional request arguments
-            
-        Returns:
-            Response object or None if all retries failed
-        """
-        max_retries = 5
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            try:
-                response = await self.client.request(method, url, **kwargs)
-                
-                if await self.handle_rate_limit(response):
-                    retry_count += 1
-                    continue
-                    
-                return response
-                
-            except Exception as e:
-                print(f"Request error: {e}, retrying in {2 ** retry_count} seconds")
-                await asyncio.sleep(2 ** retry_count)
-                retry_count += 1
-                
-        print(f"Max retries exceeded for {method} {url}")
-        return None
+        return response
     
     async def get_issue_details(self, issue_number: int) -> Optional[Dict[str, Any]]:
-        """
-        Get issue details including node_id from GitHub API.
-        
-        Args:
-            issue_number: Issue number to fetch
-            
-        Returns:
-            Issue data dict or None if failed
-        """
+        """Get issue details including node_id from GitHub API."""
         url = f"{self.github_api_url}/repos/{self.repository}/issues/{issue_number}"
         
-        response = await self.make_request_with_retry(
-            "GET", url, headers=self.headers
-        )
-        
-        if not response or response.status_code != 200:
-            print_flush(f"   ❌ HTTP {response.status_code if response else 'No response'} getting issue #{issue_number} details")
-            return None
-            
         try:
-            data = response.json()
-            
-            # Check for null response
-            if data is None:
-                print_flush(f"   ❌ Empty JSON response for issue #{issue_number}")
-                return None
-                
-            return data
+            response = await self.make_api_request("GET", url, headers=self.headers)
+            return response.json()
         except Exception as e:
-            print_flush(f"   ❌ Failed to parse issue #{issue_number} JSON: {e}")
+            print_flush(f"   ❌ Failed to get issue #{issue_number} details: {e}")
             return None
     
     async def find_project_item_id(self, issue_id: str) -> Optional[str]:
-        """
-        Find project item ID for a given issue using GraphQL pagination.
-        
-        Args:
-            issue_id: GitHub issue node ID
-            
-        Returns:
-            Project item ID or None if not found
-        """
-        cursor = ""
-        page_count = 0
-        
-        while True:
-            page_count += 1
-            if page_count > 100:  # Safety check
-                print(f"Searched 100 pages for issue {issue_id}. Stopping.")
-                break
-            
-            # Build GraphQL query with or without cursor
-            if not cursor:
-                query = """
-                query($projectId: ID!) {
-                  node(id: $projectId) {
-                    ... on ProjectV2 {
-                      items(first: 100) {
-                        pageInfo { hasNextPage endCursor }
-                        nodes {
-                          id
-                          content { ... on Issue { id } }
-                        }
-                      }
+        """Find project item ID for an issue using GraphQL."""
+        query = """
+        query($projectId: ID!, $issueId: ID!) {
+          node(id: $projectId) {
+            ... on ProjectV2 {
+              items(first: 100) {
+                nodes {
+                  id
+                  content {
+                    ... on Issue {
+                      id
                     }
                   }
                 }
-                """
-                variables = {"projectId": self.project_id}
-            else:
-                query = """
-                query($projectId: ID!, $cursor: String!) {
-                  node(id: $projectId) {
-                    ... on ProjectV2 {
-                      items(first: 100, after: $cursor) {
-                        pageInfo { hasNextPage endCursor }
-                        nodes {
-                          id
-                          content { ... on Issue { id } }
-                        }
-                      }
-                    }
-                  }
+                pageInfo {
+                  hasNextPage
+                  endCursor
                 }
-                """
-                variables = {"projectId": self.project_id, "cursor": cursor}
-            
-            payload = {
-                "query": query,
-                "variables": variables
+              }
             }
-            
-            response = await self.make_request_with_retry(
+          }
+        }
+        """
+        
+        variables = {
+            "projectId": self.project_id,
+            "issueId": issue_id
+        }
+        
+        payload = {
+            "query": query,
+            "variables": variables
+        }
+        
+        try:
+            response = await self.make_api_request(
                 "POST", self.graphql_url, 
                 headers=self.headers, json=payload
             )
             
-            if not response or response.status_code != 200:
-                print_flush(f"   ❌ HTTP {response.status_code if response else 'No response'} searching for issue {issue_id}")
-                continue
+            data = response.json()
+            
+            # Check for GraphQL errors
+            if data.get("errors"):
+                errors = data['errors']
+                for error in errors:
+                    if error.get('type') == 'FORBIDDEN':
+                        print_flush("\n❌ PERMISSION ERROR: GitHub token doesn't have project access.")
+                        print_flush("💡 Use a Personal Access Token with 'project' and 'repo' scopes")
+                        return None
+                    elif error.get('type') == 'RATE_LIMITED':
+                        print_flush(f"🛑 GraphQL Rate Limited: {errors}")
+                        raise httpx.HTTPStatusError("GraphQL Rate Limited", request=None, response=response)
+                        
+                print_flush(f"GraphQL error finding project item: {errors}")
+                return None
                 
-            try:
-                data = response.json()
-                
-                # Check for null response (like the bash version does)
-                if data is None:
-                    print_flush(f"   ❌ Empty JSON response for issue {issue_id}")
-                    continue
-                
-                # Check for GraphQL errors (matching workflow error handling)
-                if data.get("errors"):
-                    if not self._handle_graphql_errors(data['errors'], f"finding project item for issue {issue_id}"):
-                        return None  # Fatal permission error
-                    break
-                
-                # Safely navigate the response structure
-                node_data = data.get("data")
-                if not node_data:
-                    print_flush(f"   ❌ No 'data' in GraphQL response for issue {issue_id}")
-                    continue
+            # Navigate the response structure safely
+            project_data = data.get("data", {}).get("node", {})
+            items = project_data.get("items", {}).get("nodes", [])
+            
+            for item in items:
+                content = item.get("content", {})
+                if content.get("id") == issue_id:
+                    return item.get("id")
                     
-                project_node = node_data.get("node")
-                if not project_node:
-                    print_flush(f"   ❌ No project 'node' in response for issue {issue_id}")
-                    continue
-                    
-                items_data = project_node.get("items")
-                if not items_data:
-                    print_flush(f"   ❌ No 'items' in project node for issue {issue_id}")
-                    continue
-                
-                # Look for the issue in current batch
-                items = items_data.get("nodes", [])
-                for item in items:
-                    if item and item.get("content", {}).get("id") == issue_id:
-                        return item.get("id")
-                
-                # Check if there are more pages
-                page_info = items_data.get("pageInfo", {})
-                if not page_info.get("hasNextPage"):
-                    break
-                    
-                cursor = page_info.get("endCursor")
-                
-            except Exception as e:
-                print_flush(f"   ❌ Error parsing project search response for issue {issue_id}: {e}")
-                print_flush(f"   📄 Response status: {response.status_code if response else 'No response'}")
-                break
-        
-        return None
+            print_flush(f"   ⚠️ Issue {issue_id} not found in project")
+            return None
+            
+        except Exception as e:
+            print_flush(f"   ❌ Error finding project item for issue {issue_id}: {e}")
+            return None
     
     async def get_issue_field_values(self, item_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get issue field values including Status and Work Started.
-        
-        Args:
-            item_id: Project item ID
-            
-        Returns:
-            Field values dict or None if failed
-        """
+        """Get issue field values including Status and Work Started."""
         query = """
         query($itemId: ID!) {
           node(id: $itemId) {
@@ -379,7 +207,6 @@ class GitHubProjectUpdater:
                       }
                     }
                     name
-                    updatedAt
                   }
                   ... on ProjectV2ItemFieldDateValue {
                     field {
@@ -389,7 +216,6 @@ class GitHubProjectUpdater:
                       }
                     }
                     date
-                    updatedAt
                   }
                 }
               }
@@ -398,278 +224,219 @@ class GitHubProjectUpdater:
         }
         """
         
+        variables = {"itemId": item_id}
         payload = {
             "query": query,
-            "variables": {"itemId": item_id}
+            "variables": variables
         }
         
-        response = await self.make_request_with_retry(
-            "POST", self.graphql_url,
-            headers=self.headers, json=payload
-        )
-        
-        if not response or response.status_code != 200:
-            print_flush(f"   ❌ HTTP {response.status_code if response else 'No response'} getting field values for item {item_id}")
-            return None
-            
         try:
+            response = await self.make_api_request(
+                "POST", self.graphql_url,
+                headers=self.headers, json=payload
+            )
+            
             data = response.json()
             
-            # Check for null response (matching workflow pattern)  
-            if data is None:
-                print_flush(f"   ❌ Empty JSON response getting field values for item {item_id}")
-                return None
-            
-            # Check for GraphQL errors (matching workflow error handling)
+            # Check for GraphQL errors
             if data.get("errors"):
-                if not self._handle_graphql_errors(data['errors'], "getting field values"):
-                    return None  # Fatal permission error
+                errors = data['errors']
+                for error in errors:
+                    if error.get('type') == 'RATE_LIMITED':
+                        print_flush(f"🛑 GraphQL Rate Limited getting field values: {errors}")
+                        raise httpx.HTTPStatusError("GraphQL Rate Limited", request=None, response=response)
+                        
+                print_flush(f"GraphQL error getting field values: {errors}")
                 return None
                 
-            # Verify we have the expected structure
-            if not data.get("data"):
-                print_flush(f"   ❌ No 'data' in GraphQL response for field values")
-                return None
+            # Navigate response structure
+            item_data = data.get("data", {}).get("node", {})
+            field_values = item_data.get("fieldValues", {}).get("nodes", [])
+            
+            # Extract field values
+            fields = {}
+            for field_value in field_values:
+                field_info = field_value.get("field", {})
+                field_name = field_info.get("name")
                 
-            return data
+                if field_name:
+                    if "name" in field_value:  # Single select field
+                        fields[field_name] = field_value["name"]
+                    elif "date" in field_value:  # Date field
+                        fields[field_name] = field_value["date"]
+                        
+            return fields
             
         except Exception as e:
-            print_flush(f"   ❌ Error parsing field values response: {e}")
+            print_flush(f"   ❌ Error getting field values for item {item_id}: {e}")
             return None
     
-    async def update_work_started_field(self, item_id: str, date: str) -> bool:
-        """
-        Update the Work Started field for a project item.
-        
-        Args:
-            item_id: Project item ID
-            date: Date to set in YYYY-MM-DD format
-            
-        Returns:
-            True if successful, False otherwise
-        """
+    async def update_work_started_field(self, item_id: str, date_value: str) -> bool:
+        """Update Work Started field for a project item."""
         mutation = """
-        mutation {
-          updateProjectV2ItemFieldValue(input: {
-            projectId: "%s",
-            itemId: "%s",
-            fieldId: "%s",
-            value: { date: "%s" }
-          }) {
+        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: ProjectV2FieldDateValue!) {
+          updateProjectV2ItemFieldValue(
+            input: {
+              projectId: $projectId
+              itemId: $itemId
+              fieldId: $fieldId
+              value: $value
+            }
+          ) {
             clientMutationId
           }
         }
-        """ % (self.project_id, item_id, self.work_started_field_id, date)
+        """
         
-        payload = {"query": mutation}
+        variables = {
+            "projectId": self.project_id,
+            "itemId": item_id,
+            "fieldId": self.work_started_field_id,
+            "value": {"date": date_value}
+        }
         
-        response = await self.make_request_with_retry(
-            "POST", self.graphql_url,
-            headers=self.headers, json=payload
-        )
+        payload = {
+            "query": mutation,
+            "variables": variables
+        }
         
-        if not response or response.status_code != 200:
-            print_flush(f"   ❌ HTTP {response.status_code if response else 'No response'} updating Work Started field")
-            return False
-            
         try:
+            response = await self.make_api_request(
+                "POST", self.graphql_url,
+                headers=self.headers, json=payload
+            )
+            
             data = response.json()
             
-            # Check for null response (matching workflow pattern)
-            if data is None:
-                print_flush(f"   ❌ Empty JSON response updating Work Started field")
-                return False
-            
-            # Check for GraphQL errors (matching workflow error handling)
+            # Check for GraphQL errors
             if data.get("errors"):
-                if not self._handle_graphql_errors(data['errors'], "updating Work Started field"):
-                    return False  # Fatal permission error
+                errors = data['errors']
+                for error in errors:
+                    if error.get('type') == 'RATE_LIMITED':
+                        print_flush(f"🛑 GraphQL Rate Limited updating Work Started field: {errors}")
+                        raise httpx.HTTPStatusError("GraphQL Rate Limited", request=None, response=response)
+                        
+                print_flush(f"GraphQL error updating Work Started field: {errors}")
                 return False
                 
-            # Verify successful mutation (workflow checks for clientMutationId)
+            # Check for successful mutation
             mutation_data = data.get("data", {}).get("updateProjectV2ItemFieldValue")
-            if not mutation_data:
+            if mutation_data:
+                print_flush(f"   ✅ Updated Work Started field")
+                return True
+            else:
                 print_flush(f"   ❌ No mutation data in update response")
                 return False
                 
-            return True
-            
         except Exception as e:
-            print_flush(f"   ❌ Error parsing update response: {e}")
+            print_flush(f"   ❌ Error updating Work Started field for item {item_id}: {e}")
             return False
     
     async def process_issue(self, issue_number: int) -> None:
-        """
-        Process a single issue: check status and update Work Started if needed.
+        """Process a single issue: check status and update Work Started if needed."""
+        print_flush(f"🔄 Processing issue #{issue_number}...")
         
-        Args:
-            issue_number: Issue number to process
-        """
-
-        repo = last_processed_issue_number.get(issue_number)
-        if repo == self.repository:
-            print_flush(f"⏭️  Issue #{issue_number} already processed, skipping...")
-            return
-        
-        async with self.semaphore:
-            try:
-                print_flush(f"🔄 Processing issue #{issue_number}...")
-                
-                # Get issue details
-                print_flush(f"   🔍 Getting details for issue #{issue_number}...")
-                try:
-                    issue_details = await asyncio.wait_for(
-                        self.get_issue_details(issue_number), timeout=30.0
-                    )
-                except asyncio.TimeoutError:
-                    print_flush(f"   ⏰ Timeout getting details for issue #{issue_number}")
-                    self.error_count += 1
-                    return
-                if not issue_details:
-                    print_flush(f"   ❌ Could not get issue #{issue_number} details, skipping")
-                    self.error_count += 1
-                    return
-                
-                issue_id = issue_details.get("node_id")
-                if not issue_id:
-                    print_flush(f"   ❌ Could not get issue ID for #{issue_number}, skipping")
-                    self.error_count += 1
-                    return
-                
-                print_flush(f"   ✅ Got issue details for #{issue_number} (ID: {issue_id[:20]}...)")
-                
-                # Find project item ID
-                print_flush(f"   🔍 Finding project item for issue #{issue_number}...")
-                try:
-                    item_id = await asyncio.wait_for(
-                        self.find_project_item_id(issue_id), timeout=45.0
-                    )
-                except asyncio.TimeoutError:
-                    print_flush(f"   ⏰ Timeout finding project item for issue #{issue_number}")
-                    self.error_count += 1
-                    return
-                if not item_id:
-                    print_flush(f"   ⚠️  Issue #{issue_number} not found in project, skipping")
-                    self.processed_count += 1
-                    return
-                
-                print_flush(f"   ✅ Found project item for #{issue_number} (Item ID: {item_id[:20]}...)")
-                
-                # Get field values
-                print_flush(f"   🔍 Getting field values for issue #{issue_number}...")
-                try:
-                    field_data = await asyncio.wait_for(
-                        self.get_issue_field_values(item_id), timeout=30.0
-                    )
-                except asyncio.TimeoutError:
-                    print_flush(f"   ⏰ Timeout getting field values for issue #{issue_number}")
-                    self.error_count += 1
-                    return
-                if not field_data:
-                    print_flush(f"   ❌ Could not get field values for issue #{issue_number}")
-                    self.error_count += 1
-                    return
-                
-                print_flush(f"   ✅ Got field values for issue #{issue_number}")
-                
-                # Parse field values
-                field_nodes = field_data.get("data", {}).get("node", {}).get("fieldValues", {}).get("nodes", [])
-                
-                status_value = None
-                status_updated_at = None
-                work_started_value = None
-                
-                valid_statuses = {"In Progress", "Assigned", "Screen", "Blocked", "Done", "In Review"}
-                
-                for node in field_nodes:
-                    # Check for Status field
-                    if node.get("name") in valid_statuses:
-                        status_value = node.get("name")
-                        status_updated_at = node.get("updatedAt")
-                    
-                    # Check for Work Started field
-                    field = node.get("field", {})
-                    if (field.get("id") == self.work_started_field_id or 
-                        field.get("name") == "Work Started"):
-                        work_started_value = node.get("date")
-                
-                print_flush(f"   📋 Issue #{issue_number}: Status='{status_value}', Work Started='{work_started_value}'")
-                
-                # Check if we need to update
-                if (status_value == "In Progress" and 
-                    (not work_started_value or work_started_value == "null")):
-                    
-                    print_flush(f"   🔄 Issue #{issue_number} needs Work Started update...")
-                    
-                    # Determine the date to use
-                    if status_updated_at and status_updated_at != "null":
-                        work_started_date = status_updated_at.split('T')[0]
-                        print_flush(f"   📅 Using status change date: {work_started_date}")
-                    else:
-                        from datetime import date
-                        work_started_date = date.today().strftime('%Y-%m-%d')
-                        print_flush(f"   📅 Using current date: {work_started_date}")
-                    
-                    # Update the field
-                    print_flush(f"   🔍 Updating Work Started field for issue #{issue_number}...")
-                    try:
-                        update_result = await asyncio.wait_for(
-                            self.update_work_started_field(item_id, work_started_date), timeout=30.0
-                        )
-                    except asyncio.TimeoutError:
-                        print_flush(f"   ⏰ Timeout updating field for issue #{issue_number}")
-                        self.error_count += 1
-                        return
-                    
-                    if update_result:
-                        print_flush(f"   ✅ Updated Work Started for issue #{issue_number} to {work_started_date}")
-                        self.updated_count += 1
-                    else:
-                        print_flush(f"   ❌ Failed to update Work Started for issue #{issue_number}")
-                        self.error_count += 1
-                else:
-                    print_flush(f"   ⏭️  Issue #{issue_number}: No update needed")
-                    if status_value == "In Progress":
-                        print_flush(f"   💾 Caching processed issue #{issue_number}")
-                        last_processed_issue_number[issue_number] = self.repository
-                
-                print_flush(f"   ✅ Completed processing issue #{issue_number}")
-                self.processed_count += 1
-                
-            except Exception as e:
-                print_flush(f"   ❌ Error processing issue #{issue_number}: {e}")
+        try:
+            # Step 1: Get issue details
+            print_flush(f"   📋 Getting issue details...")
+            issue_data = await asyncio.wait_for(
+                self.get_issue_details(issue_number), timeout=60.0
+            )
+            
+            if not issue_data:
+                print_flush(f"   ❌ Failed to get issue #{issue_number} details")
                 self.error_count += 1
-    
+                return
+                
+            issue_id = issue_data.get("node_id")
+            if not issue_id:
+                print_flush(f"   ❌ No node_id found for issue #{issue_number}")
+                self.error_count += 1
+                return
+                
+            print_flush(f"   ✅ Got issue details (ID: {issue_id})")
+            
+            # Step 2: Find project item ID
+            print_flush(f"   🔍 Finding project item...")
+            item_id = await asyncio.wait_for(
+                self.find_project_item_id(issue_id), timeout=60.0
+            )
+            
+            if not item_id:
+                print_flush(f"   ⚠️ Issue #{issue_number} not found in project, skipping")
+                self.processed_count += 1
+                return
+                
+            print_flush(f"   ✅ Found project item (ID: {item_id})")
+            
+            # Step 3: Get current field values
+            print_flush(f"   📊 Getting field values...")
+            field_values = await asyncio.wait_for(
+                self.get_issue_field_values(item_id), timeout=60.0
+            )
+            
+            if field_values is None:
+                print_flush(f"   ❌ Failed to get field values for issue #{issue_number}")
+                self.error_count += 1
+                return
+                
+            status = field_values.get("Status", "")
+            work_started = field_values.get("Work Started", "")
+            
+            print_flush(f"   📊 Status: '{status}', Work Started: '{work_started}'")
+            
+            # Step 4: Update Work Started if needed
+            if status == "In Progress" and not work_started:
+                print_flush(f"   🔧 Updating Work Started field...")
+                today = time.strftime("%Y-%m-%d")
+                
+                success = await asyncio.wait_for(
+                    self.update_work_started_field(item_id, today), timeout=60.0
+                )
+                
+                if success:
+                    self.updated_count += 1
+                    print_flush(f"   ✅ Issue #{issue_number} updated successfully")
+                else:
+                    self.error_count += 1
+                    print_flush(f"   ❌ Failed to update issue #{issue_number}")
+            else:
+                print_flush(f"   ⏭️ Issue #{issue_number} doesn't need update")
+                
+            self.processed_count += 1
+            
+        except asyncio.TimeoutError:
+            print_flush(f"   ⏰ Timeout processing issue #{issue_number}")
+            self.error_count += 1
+        except Exception as e:
+            print_flush(f"   ❌ Unexpected error processing issue #{issue_number}: {e}")
+            self.error_count += 1
 
-async def get_all_repository_issues(client: httpx.AsyncClient, 
-                                  token: str, 
-                                  repository: List[str]) -> AsyncGenerator[tuple, None]:
+
+async def get_all_repository_issues(client: httpx.AsyncClient, token: str, repositories: List[str]) -> AsyncGenerator[tuple, None]:
     """
-    Async generator that fetches all open issues from repositories with pagination.
+    Fetch all open issues from repositories using pagination.
     
     Args:
-        client: httpx client
+        client: HTTP client
         token: GitHub token
-        repository: List of repositories in format ["owner/repo", ...]
+        repositories: List of repository names (e.g., ["owner/repo"])
         
     Yields:
-        Tuples of (repository_name, list_of_issue_numbers)
+        (repo_name, list_of_issue_numbers) tuples
     """
-    for repo in repository:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-        
-        page = 1
-        max_pages = 50  # Safety check to prevent infinite loops
-        
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    
+    for repo in repositories:
         print_flush(f"Fetching all open issues from repository {repo}...")
+        all_issue_numbers = []
         
-        while page <= max_pages:
-            print_flush(f"Fetching page {page} of issues...")
-            
-            # Build URL with pagination parameters
+        for page in range(1, 51):  # Max 50 pages like workflow
+            print_flush(f"   Fetching page {page} of issues...")
             url = f"https://api.github.com/repos/{repo}/issues"
             params = {
                 "state": "open",
@@ -678,140 +445,169 @@ async def get_all_repository_issues(client: httpx.AsyncClient,
             }
             
             try:
-                response = await client.get(url, headers=headers, params=params)
+                # Simple retry with tenacity for this API call too
+                @retry(
+                    stop=stop_after_attempt(3), 
+                    wait=wait_exponential(multiplier=1, min=10, max=60)
+                )
+                async def fetch_issues_page():
+                    response = await client.get(url, headers=headers, params=params)
+                    if response.status_code == 429:
+                        print_flush(f"🛑 Rate limited fetching issues, retrying...")
+                        response.raise_for_status()
+                    return response
+                
+                response = await fetch_issues_page()
                 
                 if response.status_code != 200:
-                    print(f"Error fetching issues page {page} for {repo}: {response.status_code}")
+                    print_flush(f"   ❌ Error fetching issues page {page}: {response.status_code}")
                     break
                     
-                issues_data = response.json()
-                page_issue_count = len(issues_data)
+                issues = response.json()
+                page_issue_count = len(issues)
                 
                 if page_issue_count == 0:
-                    print(f"No more issues found on page {page} for {repo}")
-                    break
-                
-                print(f"Found {page_issue_count} issues on page {page} for {repo}")
-                
-                # Yield each issue number from this page
-                yield repo, [issue.get("number") for issue in issues_data if issue.get("number")]
-                
-                # Check if we got less than 100 issues (last page)
-                if page_issue_count < 100:
-                    print(f"Last page reached for {repo} (less than 100 issues)")
+                    print_flush(f"   ✅ No more issues on page {page}")
                     break
                     
-                page += 1
+                page_issue_numbers = [issue["number"] for issue in issues]
+                all_issue_numbers.extend(page_issue_numbers)
+                print_flush(f"   ✅ Found {page_issue_count} issues on page {page}")
                 
+                if page_issue_count < 100:  # Last page
+                    print_flush(f"   ✅ Last page reached")
+                    break
+                    
             except Exception as e:
-                print(f"Error fetching issues page {page} for {repo}: {e}")
+                print_flush(f"   ❌ Error fetching issues page {page}: {e}")
                 break
-    
-        if page > max_pages:
-            print(f"Reached maximum pages ({max_pages}) for {repo}. Stopping to prevent infinite loop.")
-
-
+                
+        print_flush(f"✅ Found {len(all_issue_numbers)} total issues in {repo}")
+        yield (repo, all_issue_numbers)
 
 
 async def main():
-    """Main function to run the bulk update."""
-    import os
+    """Main function that orchestrates the bulk update process."""
+    print_flush("🚀 Starting GitHub Project Issue Bulk Update")
+    print_flush("=" * 60)
     
-    print_flush("🚀 Starting GitHub Issues Bulk Update Script")
-    print_flush("=" * 50)
-
-    global last_processed_issue_number
-    try:
-        with open("/tmp/last_processed_issue_number.txt", "r") as f:
-            last_processed_issue_number = json.load(f)
-        print_flush(f"📄 Loaded cache with {len(last_processed_issue_number)} processed issues")
-    except FileNotFoundError:
-        print_flush("📄 No existing cache file found, starting fresh")
-        last_processed_issue_number = {}
-    except Exception as e:
-        print_flush(f"📄 Error loading cache file: {e}, starting fresh")
-        last_processed_issue_number = {}
-    
-
-    # Configuration - these should match the GitHub workflow environment
+    # Configuration from environment variables
     token = os.getenv("GITHUB_TOKEN")
-    repositories = ["tenstorrent/tt-mlir"]
-    project_id = "PVT_kwDOA9MHEM4AjeTl"
-    work_started_field_id = "PVTF_lADOA9MHEM4AjeTlzgzZQtk"
-    max_concurrent = 5
+    if not token:
+        print_flush("❌ ERROR: GITHUB_TOKEN environment variable is required")
+        sys.exit(1)
+        
+    if token.startswith('ghs_'):
+        print_flush("⚠️ WARNING: GITHUB_TOKEN appears to be a GitHub App token (ghs_)")
+        print_flush("💡 For project access, consider using a Personal Access Token")
+    
+    repository = os.getenv("GITHUB_REPOSITORY", "tenstorrent/tt-mlir")
+    project_id = os.getenv("PROJECT_ID")
+    work_started_field_id = os.getenv("WORK_STARTED_FIELD_ID")
+    max_concurrent = int(os.getenv("MAX_CONCURRENT", "5"))
+    
+    if not project_id:
+        print_flush("❌ ERROR: PROJECT_ID environment variable is required")
+        sys.exit(1)
+        
+    if not work_started_field_id:
+        print_flush("❌ ERROR: WORK_STARTED_FIELD_ID environment variable is required")
+        sys.exit(1)
     
     print_flush(f"🔧 Configuration:")
-    print_flush(f"   - Repositories: {repositories}")
-    print_flush(f"   - Project ID: {project_id}")
-    print_flush(f"   - Max concurrent: {max_concurrent}")
+    print_flush(f"   Repository: {repository}")
+    print_flush(f"   Project ID: {project_id}")
+    print_flush(f"   Work Started Field ID: {work_started_field_id}")
+    print_flush(f"   Max Concurrent: {max_concurrent}")
+    print_flush(f"   Token Type: {'PAT' if token.startswith('ghp_') else 'Other'}")
     
-    if not token:
-        print_flush("❌ Error: GITHUB_TOKEN environment variable is required")
-        return    
-
-    print_flush("\n🔗 Initializing HTTP client...")
-    # Use httpx with connection pooling for better performance
-    async with httpx.AsyncClient(
-        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        timeout=httpx.Timeout(60.0)  # Increased timeout to handle rate limits better
-    ) as client:
+    # Try to read cached issue numbers first
+    cache_file = Path("/tmp/issue_numbers.txt")
+    issue_numbers = []
+    
+    if cache_file.exists():
+        print_flush(f"📂 Loading cached issue numbers from {cache_file}")
         try:
-            print_flush("🔍 Starting repository processing...")
-            async for repo, issue_numbers in get_all_repository_issues(client, token, repositories):
-                print_flush(f"\n📂 Processing repository: {repo}")
-                print_flush(f"📊 Found {len(issue_numbers)} issues to process")
-                
-                # Create updater and run
-                updater = GitHubProjectUpdater(
-                    token=token,
-                    repository=repo,
-                    project_id=project_id,
-                    work_started_field_id=work_started_field_id,
-                    client=client,
-                    max_concurrent=max_concurrent
-                )
-                
-                print_flush(f"🔄 Creating {len(issue_numbers)} processing tasks...")
-                # Create tasks for all issues
-                tasks = [
-                    updater.process_issue(issue_number) 
-                    for issue_number in issue_numbers
-                ]
-                
-                print_flush(f"⚡ Starting concurrent processing with max {max_concurrent} simultaneous requests...")
-                start_time = time.time()
-                
-                # Add progress tracking
-                progress_task = asyncio.create_task(track_progress(updater, len(issue_numbers), start_time))
-                
-                # Run all tasks concurrently (semaphore controls actual concurrency)
-                try:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                finally:
-                    progress_task.cancel()
-                    try:
-                        await progress_task
-                    except asyncio.CancelledError:
-                        pass
-                
-                end_time = time.time()
-                duration = end_time - start_time
-                
-                print_flush(f"\n📈 Repository {repo} Summary:")
-                print_flush(f"   ✅ Processed: {updater.processed_count}")
-                print_flush(f"   🔄 Updated: {updater.updated_count}")
-                print_flush(f"   ❌ Errors: {updater.error_count}")
-                print_flush(f"   ⏱️  Duration: {duration:.2f} seconds")
-
+            with open(cache_file, 'r') as f:
+                issue_numbers = [int(line.strip()) for line in f if line.strip().isdigit()]
+            print_flush(f"✅ Loaded {len(issue_numbers)} issue numbers from cache")
         except Exception as e:
-            print_flush(f"❌ Fatal error during processing: {e}")
-            import traceback
-            print_flush(traceback.format_exc())
+            print_flush(f"⚠️ Error reading cache file: {e}")
+            issue_numbers = []
+    
+    # If no cached issues, fetch from repository
+    if not issue_numbers:
+        print_flush(f"🔍 No cached issues found, fetching from repository...")
+        repositories = [repository]
+        
+        timeout = httpx.Timeout(60.0, connect=30.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async for repo_name, repo_issue_numbers in get_all_repository_issues(client, token, repositories):
+                issue_numbers.extend(repo_issue_numbers)
+                
+        # Save to cache
+        if issue_numbers:
+            print_flush(f"💾 Saving {len(issue_numbers)} issue numbers to cache")
+            with open(cache_file, 'w') as f:
+                for issue_number in issue_numbers:
+                    f.write(f"{issue_number}\n")
+    
+    if not issue_numbers:
+        print_flush("❌ No issues found to process")
+        sys.exit(1)
+    
+    print_flush(f"📊 Total issues to process: {len(issue_numbers)}")
+    print_flush("=" * 60)
+    
+    # Process issues with concurrency control
+    timeout = httpx.Timeout(60.0, connect=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Create updater instance
+        updater = GitHubProjectUpdater(
+            token=token,
+            repository=repository,
+            project_id=project_id,
+            work_started_field_id=work_started_field_id,
+            client=client,
+            max_concurrent=max_concurrent
+        )
+        
+        print_flush(f"🔄 Creating {len(issue_numbers)} processing tasks...")
+        # Create semaphore for concurrency control
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        async def process_with_semaphore(issue_number):
+            async with semaphore:
+                await updater.process_issue(issue_number)
+        
+        tasks = [process_with_semaphore(issue_number) for issue_number in issue_numbers]
+        
+        print_flush(f"⚡ Starting concurrent processing with max {max_concurrent} simultaneous requests...")
+        start_time = time.time()
+        
+        # Add progress tracking
+        progress_task = asyncio.create_task(track_progress(updater, len(issue_numbers), start_time))
+        
+        # Process all issues
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
         finally:
-            print_flush("\n💾 Saving cache...")
-            with open("/tmp/last_processed_issue_number.txt", "w") as f:
-                json.dump(last_processed_issue_number, f)
-            print_flush("✅ Cache saved successfully")
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Final statistics
+        elapsed = time.time() - start_time
+        print_flush("=" * 60)
+        print_flush("🏁 Bulk Update Complete!")
+        print_flush(f"⏱️ Total Time: {elapsed:.1f} seconds")
+        print_flush(f"📊 Issues Processed: {updater.processed_count}")
+        print_flush(f"🔄 Issues Updated: {updater.updated_count}")
+        print_flush(f"❌ Issues with Errors: {updater.error_count}")
+        if updater.processed_count > 0:
+            print_flush(f"📈 Average Rate: {updater.processed_count / elapsed:.2f} issues/sec")
 
 
 if __name__ == "__main__":
