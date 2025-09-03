@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, AsyncGenerator
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 last_processed_issue_number = {}
 
@@ -82,37 +81,105 @@ class GitHubProjectUpdater:
         self.updated_count = 0
         self.error_count = 0
         
-    @retry(
-        stop=stop_after_attempt(10), 
-        wait=wait_exponential(multiplier=1, min=30, max=300),
-        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError))
-    )
     async def make_api_request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """Make API request with automatic retry using tenacity."""
+        """Make API request with infinite retry for rate limits, limited retry for other errors."""
         debug_print(f"   🌐 Making {method} request to {url.replace(self.github_api_url, 'GitHub API')}")
         
-        response = await self.client.request(method, url, **kwargs)
+        attempt = 0
+        max_non_rate_limit_attempts = 5
         
-        # Check for rate limiting
-        if response.status_code == 403:
+        while True:
+            attempt += 1
+            
             try:
-                error_data = response.json()
-                if "API rate limit exceeded" in str(error_data):
-                    print_flush(f"🛑 Rate limited (403): {error_data}")
-                    response.raise_for_status()  # This will trigger retry
-            except Exception:
-                pass
+                response = await self.client.request(method, url, **kwargs)
                 
-        if response.status_code == 429:
-            print_flush(f"🛑 Rate limited (429): {response.headers.get('retry-after', 'unknown')} seconds")
-            response.raise_for_status()  # This will trigger retry
+                # Check for rate limiting - retry infinitely
+                if response.status_code == 403:
+                    try:
+                        error_data = response.json()
+                        if "API rate limit exceeded" in str(error_data):
+                            wait_time = 60 + random.randint(30, 120)  # 60-180 seconds
+                            print_flush(f"🛑 Rate limited (403): Retrying in {wait_time}s (attempt #{attempt})")
+                            await asyncio.sleep(wait_time)
+                            continue  # Infinite retry for rate limits
+                    except Exception:
+                        pass
+                        
+                if response.status_code == 429:
+                    retry_after = response.headers.get('retry-after')
+                    if retry_after:
+                        wait_time = int(retry_after) + random.randint(10, 30)
+                    else:
+                        wait_time = 60 + random.randint(30, 120)
+                        
+                    print_flush(f"🛑 Rate limited (429): Retrying in {wait_time}s (attempt #{attempt})")
+                    await asyncio.sleep(wait_time)
+                    continue  # Infinite retry for rate limits
+                    
+                # Check for other HTTP errors - limited retry
+                if response.status_code >= 400:
+                    if attempt < max_non_rate_limit_attempts:
+                        wait_time = (2 ** attempt) + random.randint(1, 10)
+                        print_flush(f"❌ HTTP {response.status_code}: Retrying in {wait_time}s (attempt {attempt}/{max_non_rate_limit_attempts})")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        print_flush(f"❌ HTTP {response.status_code} after {max_non_rate_limit_attempts} attempts: {response.text}")
+                        response.raise_for_status()
+                        
+                return response
+                
+            except httpx.RequestError as e:
+                if attempt < max_non_rate_limit_attempts:
+                    wait_time = (2 ** attempt) + random.randint(1, 10)
+                    print_flush(f"❌ Request error: {e}, retrying in {wait_time}s (attempt {attempt}/{max_non_rate_limit_attempts})")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    print_flush(f"❌ Request error after {max_non_rate_limit_attempts} attempts: {e}")
+                    raise
+    
+    async def make_graphql_request_with_infinite_retry(self, query: str, variables: dict) -> dict:
+        """Make GraphQL request with infinite retry for rate limits."""
+        payload = {
+            "query": query,
+            "variables": variables
+        }
+        
+        attempt = 0
+        while True:
+            attempt += 1
             
-        # Check for other HTTP errors
-        if response.status_code >= 400:
-            print_flush(f"❌ HTTP {response.status_code}: {response.text}")
-            response.raise_for_status()  # This will trigger retry for 4xx/5xx
-            
-        return response
+            try:
+                response = await self.make_api_request(
+                    "POST", self.graphql_url, 
+                    headers=self.headers, json=payload
+                )
+                
+                if response.status_code != 200:
+                    print_flush(f"❌ GraphQL HTTP {response.status_code}: {response.text}")
+                    return {"errors": [{"message": f"HTTP {response.status_code}"}]}
+                
+                data = response.json()
+                
+                # Check for GraphQL rate limit errors - retry infinitely
+                if data.get("errors"):
+                    for error in data['errors']:
+                        if error.get('type') == 'RATE_LIMITED':
+                            wait_time = 60 + random.randint(30, 120)
+                            print_flush(f"🛑 GraphQL Rate Limited: Retrying in {wait_time}s (attempt #{attempt})")
+                            await asyncio.sleep(wait_time)
+                            continue  # Continue the retry loop for rate limit
+                        else:
+                            break
+                
+                return data
+                
+            except Exception as e:
+                # For other exceptions, let them propagate up
+                print_flush(f"❌ GraphQL request exception: {e}")
+                raise
     
     async def get_issue_details(self, issue_number: int) -> Optional[Dict[str, Any]]:
         """Get issue details including node_id from GitHub API."""
@@ -154,20 +221,10 @@ class GitHubProjectUpdater:
             "projectId": self.project_id
         }
         
-        payload = {
-            "query": query,
-            "variables": variables
-        }
-        
         try:
-            response = await self.make_api_request(
-                "POST", self.graphql_url, 
-                headers=self.headers, json=payload
-            )
+            data = await self.make_graphql_request_with_infinite_retry(query, variables)
             
-            data = response.json()
-            
-            # Check for GraphQL errors
+            # Check for GraphQL errors (rate limits already handled by the wrapper)
             if data.get("errors"):
                 errors = data['errors']
                 for error in errors:
@@ -175,9 +232,6 @@ class GitHubProjectUpdater:
                         print_flush("\n❌ PERMISSION ERROR: GitHub token doesn't have project access.")
                         print_flush("💡 Use a Personal Access Token with 'project' and 'repo' scopes")
                         return None
-                    elif error.get('type') == 'RATE_LIMITED':
-                        print_flush(f"🛑 GraphQL Rate Limited: {errors}")
-                        raise httpx.HTTPStatusError("GraphQL Rate Limited", request=None, response=response)
                         
                 print_flush(f"GraphQL error finding project item: {errors}")
                 return None
@@ -232,27 +286,13 @@ class GitHubProjectUpdater:
         """
         
         variables = {"itemId": item_id}
-        payload = {
-            "query": query,
-            "variables": variables
-        }
         
         try:
-            response = await self.make_api_request(
-                "POST", self.graphql_url,
-                headers=self.headers, json=payload
-            )
+            data = await self.make_graphql_request_with_infinite_retry(query, variables)
             
-            data = response.json()
-            
-            # Check for GraphQL errors
+            # Check for GraphQL errors (rate limits already handled by the wrapper)
             if data.get("errors"):
                 errors = data['errors']
-                for error in errors:
-                    if error.get('type') == 'RATE_LIMITED':
-                        print_flush(f"🛑 GraphQL Rate Limited getting field values: {errors}")
-                        raise httpx.HTTPStatusError("GraphQL Rate Limited", request=None, response=response)
-                        
                 print_flush(f"GraphQL error getting field values: {errors}")
                 return None
                 
@@ -302,27 +342,12 @@ class GitHubProjectUpdater:
             "value": {"date": date_value}
         }
         
-        payload = {
-            "query": mutation,
-            "variables": variables
-        }
-        
         try:
-            response = await self.make_api_request(
-                "POST", self.graphql_url,
-                headers=self.headers, json=payload
-            )
+            data = await self.make_graphql_request_with_infinite_retry(mutation, variables)
             
-            data = response.json()
-            
-            # Check for GraphQL errors
+            # Check for GraphQL errors (rate limits already handled by the wrapper)
             if data.get("errors"):
                 errors = data['errors']
-                for error in errors:
-                    if error.get('type') == 'RATE_LIMITED':
-                        print_flush(f"🛑 GraphQL Rate Limited updating Work Started field: {errors}")
-                        raise httpx.HTTPStatusError("GraphQL Rate Limited", request=None, response=response)
-                        
                 print_flush(f"GraphQL error updating Work Started field: {errors}")
                 return False
                 
@@ -452,19 +477,53 @@ async def get_all_repository_issues(client: httpx.AsyncClient, token: str, repos
             }
             
             try:
-                # Simple retry with tenacity for this API call too
-                @retry(
-                    stop=stop_after_attempt(3), 
-                    wait=wait_exponential(multiplier=1, min=10, max=60)
-                )
-                async def fetch_issues_page():
-                    response = await client.get(url, headers=headers, params=params)
-                    if response.status_code == 429:
-                        print_flush(f"🛑 Rate limited fetching issues, retrying...")
-                        response.raise_for_status()
-                    return response
+                # Simple retry with infinite retry for rate limits
+                attempt = 0
+                max_attempts = 5
                 
-                response = await fetch_issues_page()
+                while True:
+                    attempt += 1
+                    
+                    try:
+                        response = await client.get(url, headers=headers, params=params)
+                        
+                        # Handle rate limiting - retry infinitely
+                        if response.status_code == 429:
+                            retry_after = response.headers.get('retry-after')
+                            wait_time = int(retry_after) + random.randint(10, 30) if retry_after else 60 + random.randint(30, 120)
+                            print_flush(f"🛑 Rate limited fetching issues: Retrying in {wait_time}s (attempt #{attempt})")
+                            await asyncio.sleep(wait_time)
+                            continue  # Infinite retry for rate limits
+                            
+                        if response.status_code == 403:
+                            try:
+                                error_data = response.json()
+                                if "API rate limit exceeded" in str(error_data):
+                                    wait_time = 60 + random.randint(30, 120)
+                                    print_flush(f"🛑 Rate limited (403) fetching issues: Retrying in {wait_time}s (attempt #{attempt})")
+                                    await asyncio.sleep(wait_time)
+                                    continue  # Infinite retry for rate limits
+                            except Exception:
+                                pass
+                                
+                        # For other errors, limited retry
+                        if response.status_code >= 400:
+                            if attempt < max_attempts:
+                                wait_time = (2 ** attempt) + random.randint(1, 10)
+                                print_flush(f"❌ HTTP {response.status_code} fetching issues: Retrying in {wait_time}s (attempt {attempt}/{max_attempts})")
+                                await asyncio.sleep(wait_time)
+                                continue
+                        
+                        break  # Success or non-retryable error
+                        
+                    except httpx.RequestError as e:
+                        if attempt < max_attempts:
+                            wait_time = (2 ** attempt) + random.randint(1, 10)
+                            print_flush(f"❌ Request error fetching issues: {e}, retrying in {wait_time}s (attempt {attempt}/{max_attempts})")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            raise
                 
                 if response.status_code != 200:
                     print_flush(f"   ❌ Error fetching issues page {page}: {response.status_code}")
