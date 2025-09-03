@@ -45,7 +45,6 @@ async def track_progress(updater, total_issues: int, start_time: float):
                        f"({processed/total_issues*100:.1f}%) - "
                        f"Rate: {rate:.1f}/sec - "
                        f"ETA: {estimated_remaining/60:.1f}min - "
-                       f"Repository: {updater.repository} - "
                        f"✅{updater.processed_count} ❌{updater.error_count} 🔄{updater.updated_count}")
         else:
             print_flush(f"📊 Progress: Waiting for first issue to complete... ({elapsed:.1f}s elapsed)")
@@ -703,10 +702,12 @@ async def main():
         try:
             with open(cache_file, 'r') as f:
                 processed_issue_numbers = json.load(f)
-            print_flush(f"✅ Loaded {len(processed_issue_numbers)} issue numbers from cache")
+            print_flush(f"✅ Loaded {len(processed_issue_numbers)} processed issue numbers from cache")
         except Exception as e:
             print_flush(f"⚠️ Error reading cache file: {e}")
             processed_issue_numbers = []
+    else:
+        processed_issue_numbers = []
     
     
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -717,32 +718,39 @@ async def main():
     timeout = httpx.Timeout(300.0, connect=60.0)  # Much higher timeouts to avoid network interference
     async with httpx.AsyncClient(timeout=timeout) as client:
         async for repo_name, repo_issue_numbers in get_all_repository_issues(client, token, repositories):
+            print_flush(f"📊 Processing {len(repo_issue_numbers)} issues from repository: {repo_name}")
             
-            # Process issues with concurrency control
-            timeout = httpx.Timeout(60.0, connect=30.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                # Create updater instance
-                updater = GitHubProjectUpdater(
-                    token=token,
-                    repository=repository,
-                    project_id=project_id,
-                    work_started_field_id=work_started_field_id,
-                    client=client,
-                    max_concurrent=max_concurrent
-                )
+            # Filter out already processed issues
+            issues_to_process = [issue for issue in repo_issue_numbers if issue not in processed_issue_numbers]
+            if len(issues_to_process) != len(repo_issue_numbers):
+                print_flush(f"📂 Skipping {len(repo_issue_numbers) - len(issues_to_process)} already processed issues")
+            
+            if not issues_to_process:
+                print_flush(f"✅ All issues in {repo_name} already processed, skipping")
+                continue
                 
-                print_flush(f"🔄 Creating {len(repo_issue_numbers)} processing tasks...")
-            # Create semaphore for concurrency control
+            # Create updater instance for this repository
+            updater = GitHubProjectUpdater(
+                token=token,
+                repository=repo_name,
+                project_id=project_id,
+                work_started_field_id=work_started_field_id,
+                client=client,
+                max_concurrent=max_concurrent
+            )
+            
+            print_flush(f"🔄 Creating {len(issues_to_process)} processing tasks...")
             
             async def process_with_semaphore(issue_number):
                 async with semaphore:
                     await updater.process_issue_with_infinite_retry(issue_number)
+                    # Track processed issue
+                    processed_issue_numbers.append(issue_number)
             
-            tasks = [process_with_semaphore(issue_number) for issue_number in repo_issue_numbers]
-            
+            tasks = [process_with_semaphore(issue_number) for issue_number in issues_to_process]
             
             # Add progress tracking
-            progress_task = asyncio.create_task(track_progress(updater, len(issue_numbers), start_time))
+            progress_task = asyncio.create_task(track_progress(updater, len(issues_to_process), start_time))
             
             # Process all issues
             try:
@@ -753,25 +761,26 @@ async def main():
                     await progress_task
                 except asyncio.CancelledError:
                     pass
+            
+            # Save progress after each repository
+            print_flush(f"💾 Saving progress after processing {repo_name}")
+            try:
+                with open(cache_file, 'w') as f:
+                    json.dump(processed_issue_numbers, f)
+            except Exception as e:
+                print_flush(f"⚠️ Error saving progress: {e}")
         
-        # Final statistics
-        elapsed = time.time() - start_time
-        print_flush("=" * 60)
-        print_flush("🏁 Bulk Update Complete!")
-        print_flush(f"⏱️ Total Time: {elapsed:.1f} seconds")
-        print_flush(f"📊 Issues Processed: {updater.processed_count}")
-        print_flush(f"🔄 Issues Updated: {updater.updated_count}")
-        print_flush(f"❌ Issues with Errors: {updater.error_count}")
-        if updater.processed_count > 0:
-            print_flush(f"📈 Average Rate: {updater.processed_count / elapsed:.2f} issues/sec")
-        
+    # Final statistics
+    elapsed = time.time() - start_time
+    print_flush("=" * 60)
+    print_flush("🏁 Bulk Update Complete!")
+    print_flush(f"⏱️ Total Time: {elapsed:.1f} seconds")
+    print_flush(f"📊 Total Issues Processed: {len(processed_issue_numbers)}")
+    if len(processed_issue_numbers) > 0:
+        print_flush(f"📈 Average Rate: {len(processed_issue_numbers) / elapsed:.2f} issues/sec")
+    print_flush(f"💾 Progress saved to: {cache_file}")
+    
 
 
 if __name__ == "__main__":
-    global processed_issue_numbers
-    try:
-        asyncio.run(main())
-    finally:
-        # Save processed issue numbers to cache
-        with open(cache_file, 'w') as f:
-            json.dump(processed_issue_numbers, f)
+    asyncio.run(main())
