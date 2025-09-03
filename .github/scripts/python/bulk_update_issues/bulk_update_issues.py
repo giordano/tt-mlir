@@ -194,6 +194,19 @@ class GitHubProjectUpdater:
     
     async def find_project_item_id(self, issue_id: str) -> Optional[str]:
         """Find project item ID for an issue using GraphQL with pagination (matching bash workflow)."""
+        # Validate issue_id format
+        if not issue_id:
+            print_flush(f"   ❌ Empty issue_id provided")
+            return None
+            
+        # Check if this is a Pull Request ID (starts with PR_) instead of Issue ID (starts with I_)
+        if issue_id.startswith('PR_'):
+            print_flush(f"   ❌ Found Pull Request ID instead of Issue ID: {issue_id}")
+            print_flush(f"   💡 This script only processes Issues, not Pull Requests")
+            return None
+        elif not issue_id.startswith('I_'):
+            print_flush(f"   ⚠️ Unexpected node_id format: {issue_id} (expected to start with I_)")
+            
         cursor = None
         page_count = 0
         max_pages = 100  # Safety limit like the bash version
@@ -267,15 +280,32 @@ class GitHubProjectUpdater:
                     print_flush(f"GraphQL error finding project item: {errors}")
                     return None
                     
-                # Navigate the response structure safely
-                project_data = data.get("data", {}).get("node", {})
-                items_data = project_data.get("items", {})
-                items = items_data.get("nodes", [])
-                page_info = items_data.get("pageInfo", {})
+                # Navigate the response structure safely with None checks
+                data_section = data.get("data")
+                if not data_section:
+                    print_flush(f"   ❌ No data section in GraphQL response for page {page_count}")
+                    return None
+                
+                project_data = data_section.get("node")
+                if not project_data:
+                    print_flush(f"   ❌ No project node data for page {page_count}")
+                    return None
+                
+                items_data = project_data.get("items")
+                if not items_data:
+                    print_flush(f"   ❌ No items data for page {page_count}")
+                    return None
+                
+                items = items_data.get("nodes") or []
+                page_info = items_data.get("pageInfo") or {}
                 
                 # Look for the issue in current batch (matching bash logic)
                 for item in items:
-                    content = item.get("content", {})
+                    if not item:  # Skip None items
+                        continue
+                    content = item.get("content")
+                    if not content:  # Skip items without content
+                        continue
                     if content.get("id") == issue_id:
                         debug_print(f"   ✅ Found issue in project page {page_count}")
                         return item.get("id")
@@ -317,6 +347,8 @@ class GitHubProjectUpdater:
                       }
                     }
                     name
+                    optionId
+                    updatedAt
                   }
                   ... on ProjectV2ItemFieldDateValue {
                     field {
@@ -326,6 +358,7 @@ class GitHubProjectUpdater:
                       }
                     }
                     date
+                    updatedAt
                   }
                 }
               }
@@ -349,17 +382,43 @@ class GitHubProjectUpdater:
             item_data = data.get("data", {}).get("node", {})
             field_values = item_data.get("fieldValues", {}).get("nodes", [])
             
-            # Extract field values
+            # Extract field values with timestamps (matching workflow logic)
             fields = {}
+            status_info = {}
+            work_started_info = {}
+            
             for field_value in field_values:
+                if not field_value:
+                    continue
+                    
                 field_info = field_value.get("field", {})
                 field_name = field_info.get("name")
+                field_id = field_info.get("id")
                 
                 if field_name:
-                    if "name" in field_value:  # Single select field
-                        fields[field_name] = field_value["name"]
-                    elif "date" in field_value:  # Date field
-                        fields[field_name] = field_value["date"]
+                    if "name" in field_value:  # Single select field (Status)
+                        status_value = field_value["name"]
+                        # Check if this is a known Status value (matching workflow)
+                        if status_value in ["In Progress", "Assigned", "Screen", "Blocked", "Done", "In Review"]:
+                            fields[field_name] = status_value
+                            status_info = {
+                                "value": status_value,
+                                "updatedAt": field_value.get("updatedAt"),
+                                "fieldId": field_id
+                            }
+                    elif "date" in field_value:  # Date field (Work Started)
+                        # Check both field name and field ID (matching workflow)
+                        if field_name == "Work Started" or field_id == self.work_started_field_id:
+                            fields[field_name] = field_value["date"]
+                            work_started_info = {
+                                "value": field_value["date"],
+                                "updatedAt": field_value.get("updatedAt"),
+                                "fieldId": field_id
+                            }
+            
+            # Add metadata for date calculation logic
+            fields["_status_info"] = status_info
+            fields["_work_started_info"] = work_started_info
                         
             return fields
             
@@ -467,25 +526,41 @@ class GitHubProjectUpdater:
             
         status = field_values.get("Status", "")
         work_started = field_values.get("Work Started", "")
+        status_info = field_values.get("_status_info", {})
+        work_started_info = field_values.get("_work_started_info", {})
         
         print_flush(f"   📊 Status: '{status}', Work Started: '{work_started}'")
         
-        # Step 4: Update Work Started if needed
-        if status == "In Progress" and not work_started:
+        # Step 4: Update Work Started if needed (matching workflow logic exactly)
+        # Condition: Status is "In Progress" AND Work Started is empty/null
+        if status == "In Progress" and (not work_started or work_started == "null"):
             debug_print(f"   🔧 Updating Work Started field...")
-            today = time.strftime("%Y-%m-%d")
             
-            success = await self.update_work_started_field(item_id, today)
+            # Use the date when status changed to 'In Progress', with fallback to current date (matching workflow)
+            status_updated_at = status_info.get("updatedAt")
+            if status_updated_at and status_updated_at != "null":
+                # Extract date part from timestamp (YYYY-MM-DD)
+                work_started_date = status_updated_at.split('T')[0]
+                print_flush(f"   📅 Using status change date: {work_started_date} (from timestamp: {status_updated_at})")
+            else:
+                # Fallback to current date
+                work_started_date = time.strftime("%Y-%m-%d")
+                print_flush(f"   📅 Could not determine status change date, using current date: {work_started_date}")
+            
+            success = await self.update_work_started_field(item_id, work_started_date)
             
             if success:
                 self.updated_count += 1
-                print_flush(f"   ✅ Issue #{issue_number} updated successfully")
+                print_flush(f"   ✅ Updated Work Started for issue #{issue_number} to {work_started_date} (date when status changed)")
             else:
                 raise Exception(f"Failed to update issue #{issue_number}")
         else:
-            print_flush(f"   ⏭️ Issue #{issue_number} doesn't need update")
+            print_flush(f"   ⏭️ Issue #{issue_number}: Status='{status}', Work Started='{work_started}' - no update needed")
             
         self.processed_count += 1
+        
+        # Add rate limiting delay like workflow (1 second between issues)
+        await asyncio.sleep(1)
 
 
 async def get_all_repository_issues(client: httpx.AsyncClient, token: str, repositories: List[str]) -> AsyncGenerator[tuple, None]:
@@ -605,11 +680,7 @@ async def main():
     if not token:
         print_flush("❌ ERROR: GITHUB_TOKEN environment variable is required")
         sys.exit(1)
-        
-    if token.startswith('ghs_'):
-        print_flush("⚠️ WARNING: GITHUB_TOKEN appears to be a GitHub App token (ghs_)")
-        print_flush("💡 For project access, consider using a Personal Access Token")
-    
+         
     repository = os.getenv("GITHUB_REPOSITORY", "tenstorrent/tt-mlir")
     project_id = os.getenv("project_id")
     work_started_field_id = os.getenv("work_started_field_id")
