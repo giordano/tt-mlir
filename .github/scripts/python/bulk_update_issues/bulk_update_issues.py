@@ -687,7 +687,7 @@ async def main():
         sys.exit(1)
     
     print_flush(f"🔧 Configuration:")
-    print_flush(f"   Repository: {repository}")
+    print_flush(f"   Repositories: {repositories}")
     print_flush(f"   Project ID: {project_id}")
     print_flush(f"   Work Started Field ID: {work_started_field_id}")
     print_flush(f"   Max Concurrent: {max_concurrent}")
