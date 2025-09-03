@@ -363,8 +363,6 @@ jobs:
     # Only run on scheduled triggers (cron)
     if: github.event_name == 'schedule' || inputs.bulk_update
     runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -383,6 +381,8 @@ jobs:
           python-version: '3.12'
 
       - name: Run bulk update
+        env:
+          GITHUB_TOKEN: ${{ secrets.TT_FORGE_PROJECT }}
         run: |
           pip install -r ./.github/scripts/python/bulk_update_issues/requirements-bulk-update.txt
           python ./.github/scripts/python/bulk_update_issues/bulk_update_issues.py

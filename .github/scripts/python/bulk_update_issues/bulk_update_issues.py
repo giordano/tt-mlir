@@ -51,6 +51,32 @@ class GitHubProjectUpdater:
         self.updated_count = 0
         self.error_count = 0
         
+    def _handle_graphql_errors(self, errors, context: str = "GraphQL operation") -> bool:
+        """
+        Handle GraphQL errors with specific permission error guidance.
+        
+        Args:
+            errors: List of GraphQL errors
+            context: Context of where the error occurred
+            
+        Returns:
+            True if this is a recoverable error, False if it's a fatal permission error
+        """
+        print(f"GraphQL error in {context}: {errors}")
+        
+        # Check for permission issues
+        for error in errors:
+            if error.get('type') == 'FORBIDDEN':
+                print("\n❌ PERMISSION ERROR: GitHub token doesn't have project access.")
+                print("💡 SOLUTIONS:")
+                print("   1. Use a Personal Access Token (PAT) instead of GITHUB_TOKEN")
+                print("   2. Ensure token has 'project' and 'repo' scopes")
+                print("   3. Add token owner as project collaborator")
+                print("   4. In GitHub Actions, use secrets.TT_FORGE_PROJECT\n")
+                return False  # Fatal permission error
+                
+        return True  # Other errors might be recoverable
+        
     async def handle_rate_limit(self, response: httpx.Response) -> bool:
         """
         Handle GitHub API rate limiting with exponential backoff.
@@ -222,7 +248,8 @@ class GitHubProjectUpdater:
                 data = response.json()
                 
                 if data.get("errors"):
-                    print(f"GraphQL error finding issue {issue_id}: {data['errors']}")
+                    if not self._handle_graphql_errors(data['errors'], f"finding project item for issue {issue_id}"):
+                        return None  # Fatal permission error
                     break
                 
                 # Look for the issue in current batch
@@ -304,7 +331,8 @@ class GitHubProjectUpdater:
             data = response.json()
             
             if data.get("errors"):
-                print(f"GraphQL error getting field values: {data['errors']}")
+                if not self._handle_graphql_errors(data['errors'], "getting field values"):
+                    return None  # Fatal permission error
                 return None
                 
             return data
@@ -351,7 +379,8 @@ class GitHubProjectUpdater:
             data = response.json()
             
             if data.get("errors"):
-                print(f"GraphQL error updating Work Started: {data['errors']}")
+                if not self._handle_graphql_errors(data['errors'], "updating Work Started field"):
+                    return False  # Fatal permission error
                 return False
                 
             return True
