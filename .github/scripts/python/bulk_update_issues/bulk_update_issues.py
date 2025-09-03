@@ -7,6 +7,7 @@ Converts the bash run_bulk_update function to Python using asyncio and httpx.
 import asyncio
 import json
 import random
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any, AsyncGenerator
@@ -14,6 +15,11 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 import httpx
 
 last_processed_issue_number = {}
+
+def print_flush(*args, **kwargs):
+    """Print with immediate flush for GitHub Actions visibility."""
+    print(*args, **kwargs)
+    sys.stdout.flush()
 
 class GitHubProjectUpdater:
     """Handles bulk updates of GitHub project issue fields with rate limiting."""
@@ -97,8 +103,20 @@ class GitHubProjectUpdater:
                     exp_factor = min(2 ** (self.error_count % 4), 8)
                     sleep_time = base_sleep * exp_factor + random.randint(0, 30)
                     
-                    print(f"Rate limited, sleeping for {sleep_time} seconds")
-                    await asyncio.sleep(sleep_time)
+                    print_flush(f"🛑 RATE LIMITED (403): Sleeping for {sleep_time} seconds...")
+                    print_flush(f"⏰ Will resume at approximately {time.strftime('%H:%M:%S', time.localtime(time.time() + sleep_time))}")
+                    
+                    # Add periodic updates during long sleeps
+                    for i in range(0, sleep_time, 30):
+                        remaining = sleep_time - i
+                        if remaining > 30:
+                            await asyncio.sleep(30)
+                            print_flush(f"💤 Still waiting... {remaining - 30} seconds remaining")
+                        else:
+                            await asyncio.sleep(remaining)
+                            break
+                    
+                    print_flush("⚡ Resuming after rate limit...")
                     return True
             except Exception:
                 pass
@@ -108,11 +126,24 @@ class GitHubProjectUpdater:
             retry_after = response.headers.get('retry-after')
             if retry_after:
                 sleep_time = int(retry_after) + random.randint(10, 30)
+                print_flush(f"🛑 RATE LIMITED (429): Server requested {retry_after}s wait, adding buffer -> {sleep_time}s")
             else:
                 sleep_time = random.randint(60, 120)
+                print_flush(f"🛑 RATE LIMITED (429): No retry-after header, using random backoff -> {sleep_time}s")
             
-            print(f"Rate limited (429), sleeping for {sleep_time} seconds")
-            await asyncio.sleep(sleep_time)
+            print_flush(f"⏰ Will resume at approximately {time.strftime('%H:%M:%S', time.localtime(time.time() + sleep_time))}")
+            
+            # Add periodic updates during sleeps
+            for i in range(0, sleep_time, 15):
+                remaining = sleep_time - i
+                if remaining > 15:
+                    await asyncio.sleep(15)
+                    print_flush(f"💤 Rate limit wait... {remaining - 15} seconds remaining")
+                else:
+                    await asyncio.sleep(remaining)
+                    break
+            
+            print_flush("⚡ Resuming after rate limit...")
             return True
             
         return False
@@ -399,12 +430,12 @@ class GitHubProjectUpdater:
 
         repo = last_processed_issue_number.get(issue_number)
         if repo == self.repository:
-            print(f"Issue #{issue_number} for repository {self.repository} already processed, skipping...")
+            print(f"⏭️  Issue #{issue_number} already processed, skipping...")
             return
         
         async with self.semaphore:
             try:
-                print(f"Processing issue #{issue_number}...")
+                print(f"🔄 Processing issue #{issue_number}...")
                 
                 # Get issue details
                 issue_details = await self.get_issue_details(issue_number)
@@ -512,10 +543,10 @@ async def get_all_repository_issues(client: httpx.AsyncClient,
         page = 1
         max_pages = 50  # Safety check to prevent infinite loops
         
-        print(f"Fetching all open issues from repository {repo}...")
+        print_flush(f"Fetching all open issues from repository {repo}...")
         
         while page <= max_pages:
-            print(f"Fetching page {page} of issues...")
+            print_flush(f"Fetching page {page} of issues...")
             
             # Build URL with pagination parameters
             url = f"https://api.github.com/repos/{repo}/issues"
@@ -564,16 +595,20 @@ async def get_all_repository_issues(client: httpx.AsyncClient,
 async def main():
     """Main function to run the bulk update."""
     import os
+    
+    print_flush("🚀 Starting GitHub Issues Bulk Update Script")
+    print_flush("=" * 50)
 
     global last_processed_issue_number
     try:
         with open("/tmp/last_processed_issue_number.txt", "r") as f:
             last_processed_issue_number = json.load(f)
+        print_flush(f"📄 Loaded cache with {len(last_processed_issue_number)} processed issues")
     except FileNotFoundError:
-        print("No existing cache file found, starting fresh")
+        print_flush("📄 No existing cache file found, starting fresh")
         last_processed_issue_number = {}
     except Exception as e:
-        print(f"Error loading cache file: {e}, starting fresh")
+        print_flush(f"📄 Error loading cache file: {e}, starting fresh")
         last_processed_issue_number = {}
     
 
@@ -584,17 +619,27 @@ async def main():
     work_started_field_id = "PVTF_lADOA9MHEM4AjeTlzgzZQtk"
     max_concurrent = 5
     
+    print_flush(f"🔧 Configuration:")
+    print_flush(f"   - Repositories: {repositories}")
+    print_flush(f"   - Project ID: {project_id}")
+    print_flush(f"   - Max concurrent: {max_concurrent}")
+    
     if not token:
-        print("Error: GITHUB_TOKEN environment variable is required")
+        print_flush("❌ Error: GITHUB_TOKEN environment variable is required")
         return    
 
+    print_flush("\n🔗 Initializing HTTP client...")
     # Use httpx with connection pooling for better performance
     async with httpx.AsyncClient(
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        timeout=httpx.Timeout(30.0)
+        timeout=httpx.Timeout(60.0)  # Increased timeout to handle rate limits better
     ) as client:
         try:
+            print_flush("🔍 Starting repository processing...")
             async for repo, issue_numbers in get_all_repository_issues(client, token, repositories):
+                print_flush(f"\n📂 Processing repository: {repo}")
+                print_flush(f"📊 Found {len(issue_numbers)} issues to process")
+                
                 # Create updater and run
                 updater = GitHubProjectUpdater(
                     token=token,
@@ -604,18 +649,38 @@ async def main():
                     client=client,
                     max_concurrent=max_concurrent
                 )
+                
+                print_flush(f"🔄 Creating {len(issue_numbers)} processing tasks...")
                 # Create tasks for all issues
                 tasks = [
                     updater.process_issue(issue_number) 
                     for issue_number in issue_numbers
                 ]
                 
+                print_flush(f"⚡ Starting concurrent processing with max {max_concurrent} simultaneous requests...")
+                start_time = time.time()
+                
                 # Run all tasks concurrently (semaphore controls actual concurrency)
                 await asyncio.gather(*tasks, return_exceptions=True)
+                
+                end_time = time.time()
+                duration = end_time - start_time
+                
+                print_flush(f"\n📈 Repository {repo} Summary:")
+                print_flush(f"   ✅ Processed: {updater.processed_count}")
+                print_flush(f"   🔄 Updated: {updater.updated_count}")
+                print_flush(f"   ❌ Errors: {updater.error_count}")
+                print_flush(f"   ⏱️  Duration: {duration:.2f} seconds")
 
+        except Exception as e:
+            print_flush(f"❌ Fatal error during processing: {e}")
+            import traceback
+            print_flush(traceback.format_exc())
         finally:
+            print_flush("\n💾 Saving cache...")
             with open("/tmp/last_processed_issue_number.txt", "w") as f:
                 json.dump(last_processed_issue_number, f)
+            print_flush("✅ Cache saved successfully")
 
 
 if __name__ == "__main__":
