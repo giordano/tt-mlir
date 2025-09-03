@@ -577,7 +577,7 @@ async def main():
                 )
                 # Create tasks for all issues
                 tasks = [
-                    self.process_issue(issue_number) 
+                    updater.process_issue(issue_number) 
                     for issue_number in issue_numbers
                 ]
                 
