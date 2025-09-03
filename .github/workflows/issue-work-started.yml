@@ -367,6 +367,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set Environment Variables
+        run: |
+          echo "project_id=PVT_kwDOA9MHEM4AjeTl" >> $GITHUB_ENV
+          echo "work_started_field_id=PVTF_lADOA9MHEM4AjeTlzgzZQtk" >> $GITHUB_ENV
+
       - name: Restore last processed issue number
         id: cache-last-processed-issue-number
         uses: actions/cache/restore@v4

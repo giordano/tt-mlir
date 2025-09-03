@@ -502,8 +502,8 @@ async def main():
         print_flush("💡 For project access, consider using a Personal Access Token")
     
     repository = os.getenv("GITHUB_REPOSITORY", "tenstorrent/tt-mlir")
-    project_id = os.getenv("PROJECT_ID")
-    work_started_field_id = os.getenv("WORK_STARTED_FIELD_ID")
+    project_id = os.getenv("project_id")
+    work_started_field_id = os.getenv("work_started_field_id")
     max_concurrent = int(os.getenv("MAX_CONCURRENT", "5"))
     
     if not project_id:
