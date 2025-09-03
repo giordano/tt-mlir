@@ -193,64 +193,113 @@ class GitHubProjectUpdater:
             return None
     
     async def find_project_item_id(self, issue_id: str) -> Optional[str]:
-        """Find project item ID for an issue using GraphQL."""
-        query = """
-        query($projectId: ID!) {
-          node(id: $projectId) {
-            ... on ProjectV2 {
-              items(first: 100) {
-                nodes {
-                  id
-                  content {
-                    ... on Issue {
-                      id
+        """Find project item ID for an issue using GraphQL with pagination (matching bash workflow)."""
+        cursor = None
+        page_count = 0
+        max_pages = 100  # Safety limit like the bash version
+        
+        while page_count < max_pages:
+            page_count += 1
+            debug_print(f"   🔍 Searching project page {page_count}...")
+            
+            # Build query with or without cursor
+            if cursor is None:
+                query = """
+                query($projectId: ID!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      items(first: 100) {
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                        nodes {
+                          id
+                          content {
+                            ... on Issue {
+                              id
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 }
-                pageInfo {
-                  hasNextPage
-                  endCursor
+                """
+                variables = {"projectId": self.project_id}
+            else:
+                query = """
+                query($projectId: ID!, $cursor: String!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      items(first: 100, after: $cursor) {
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                        nodes {
+                          id
+                          content {
+                            ... on Issue {
+                              id
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
                 }
-              }
-            }
-          }
-        }
-        """
-        
-        variables = {
-            "projectId": self.project_id
-        }
-        
-        try:
-            data = await self.make_graphql_request_with_infinite_retry(query, variables)
+                """
+                variables = {"projectId": self.project_id, "cursor": cursor}
             
-            # Check for GraphQL errors (rate limits already handled by the wrapper)
-            if data.get("errors"):
-                errors = data['errors']
-                for error in errors:
-                    if error.get('type') == 'FORBIDDEN':
-                        print_flush("\n❌ PERMISSION ERROR: GitHub token doesn't have project access.")
-                        print_flush("💡 Use a Personal Access Token with 'project' and 'repo' scopes")
-                        return None
-                        
-                print_flush(f"GraphQL error finding project item: {errors}")
-                return None
+            try:
+                data = await self.make_graphql_request_with_infinite_retry(query, variables)
                 
-            # Navigate the response structure safely
-            project_data = data.get("data", {}).get("node", {})
-            items = project_data.get("items", {}).get("nodes", [])
-            
-            for item in items:
-                content = item.get("content", {})
-                if content.get("id") == issue_id:
-                    return item.get("id")
+                # Check for GraphQL errors (rate limits already handled by the wrapper)
+                if data.get("errors"):
+                    errors = data['errors']
+                    for error in errors:
+                        if error.get('type') == 'FORBIDDEN':
+                            print_flush("\n❌ PERMISSION ERROR: GitHub token doesn't have project access.")
+                            print_flush("💡 Use a Personal Access Token with 'project' and 'repo' scopes")
+                            return None
+                            
+                    print_flush(f"GraphQL error finding project item: {errors}")
+                    return None
                     
-            print_flush(f"   ⚠️ Issue {issue_id} not found in project")
-            return None
+                # Navigate the response structure safely
+                project_data = data.get("data", {}).get("node", {})
+                items_data = project_data.get("items", {})
+                items = items_data.get("nodes", [])
+                page_info = items_data.get("pageInfo", {})
+                
+                # Look for the issue in current batch (matching bash logic)
+                for item in items:
+                    content = item.get("content", {})
+                    if content.get("id") == issue_id:
+                        debug_print(f"   ✅ Found issue in project page {page_count}")
+                        return item.get("id")
+                
+                # Check if there are more pages (matching bash logic)
+                has_next_page = page_info.get("hasNextPage", False)
+                if not has_next_page:
+                    debug_print(f"   📄 Searched all {page_count} pages. No more pages available.")
+                    break
+                
+                # Get cursor for next page
+                cursor = page_info.get("endCursor")
+                debug_print(f"   ➡️ Moving to next page with cursor: {cursor}")
+                
+            except Exception as e:
+                print_flush(f"   ❌ Error finding project item for issue {issue_id} on page {page_count}: {e}")
+                return None
+        
+        if page_count >= max_pages:
+            print_flush(f"   ⚠️ Searched {max_pages} pages (10,000+ items). Stopping to prevent infinite loop.")
             
-        except Exception as e:
-            print_flush(f"   ❌ Error finding project item for issue {issue_id}: {e}")
-            return None
+        print_flush(f"   ⚠️ Issue {issue_id} not found in project after searching {page_count} pages.")
+        print_flush(f"   💡 The issue may not be added to this project yet.")
+        return None
     
     async def get_issue_field_values(self, item_id: str) -> Optional[Dict[str, Any]]:
         """Get issue field values including Status and Work Started."""
