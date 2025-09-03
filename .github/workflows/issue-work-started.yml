@@ -377,7 +377,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            /tmp/last_processed_issue_number.txt
+            /tmp/processed_issue_numbers.json
           key: issue-work-started-bulk-update
 
       - name: python install
@@ -398,5 +398,5 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            /tmp/last_processed_issue_number.txt
+            /tmp/processed_issue_numbers.json
           key: issue-work-started-bulk-update

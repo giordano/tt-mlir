@@ -15,7 +15,7 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 
 import httpx
 
-last_processed_issue_number = {}
+processed_issue_numbers = {}
 
 # Global debug mode flag
 DEBUG_MODE = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
@@ -45,6 +45,7 @@ async def track_progress(updater, total_issues: int, start_time: float):
                        f"({processed/total_issues*100:.1f}%) - "
                        f"Rate: {rate:.1f}/sec - "
                        f"ETA: {estimated_remaining/60:.1f}min - "
+                       f"Repository: {updater.repository} - "
                        f"✅{updater.processed_count} ❌{updater.error_count} 🔄{updater.updated_count}")
         else:
             print_flush(f"📊 Progress: Waiting for first issue to complete... ({elapsed:.1f}s elapsed)")
@@ -198,15 +199,7 @@ class GitHubProjectUpdater:
         if not issue_id:
             print_flush(f"   ❌ Empty issue_id provided")
             return None
-            
-        # Check if this is a Pull Request ID (starts with PR_) instead of Issue ID (starts with I_)
-        if issue_id.startswith('PR_'):
-            print_flush(f"   ❌ Found Pull Request ID instead of Issue ID: {issue_id}")
-            print_flush(f"   💡 This script only processes Issues, not Pull Requests")
-            return None
-        elif not issue_id.startswith('I_'):
-            print_flush(f"   ⚠️ Unexpected node_id format: {issue_id} (expected to start with I_)")
-            
+             
         cursor = None
         page_count = 0
         max_pages = 100  # Safety limit like the bash version
@@ -681,7 +674,7 @@ async def main():
         print_flush("❌ ERROR: GITHUB_TOKEN environment variable is required")
         sys.exit(1)
          
-    repository = os.getenv("GITHUB_REPOSITORY", "tenstorrent/tt-mlir")
+    repositories = ["tenstorrent/tt-mlir"]
     project_id = os.getenv("project_id")
     work_started_field_id = os.getenv("work_started_field_id")
     max_concurrent = int(os.getenv("MAX_CONCURRENT", "5"))
@@ -703,81 +696,63 @@ async def main():
     print_flush(f"   Token Type: {'PAT' if token.startswith('ghp_') else 'Other'}")
     
     # Try to read cached issue numbers first
-    cache_file = Path("/tmp/issue_numbers.txt")
-    issue_numbers = []
+    cache_file = Path("/tmp/processed_issue_numbers.json")
     
     if cache_file.exists():
         print_flush(f"📂 Loading cached issue numbers from {cache_file}")
         try:
             with open(cache_file, 'r') as f:
-                issue_numbers = [int(line.strip()) for line in f if line.strip().isdigit()]
-            print_flush(f"✅ Loaded {len(issue_numbers)} issue numbers from cache")
+                processed_issue_numbers = json.load(f)
+            print_flush(f"✅ Loaded {len(processed_issue_numbers)} issue numbers from cache")
         except Exception as e:
             print_flush(f"⚠️ Error reading cache file: {e}")
-            issue_numbers = []
+            processed_issue_numbers = []
     
-    # If no cached issues, fetch from repository
-    if not issue_numbers:
-        print_flush(f"🔍 No cached issues found, fetching from repository...")
-        repositories = [repository]
-        
-        timeout = httpx.Timeout(300.0, connect=60.0)  # Much higher timeouts to avoid network interference
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async for repo_name, repo_issue_numbers in get_all_repository_issues(client, token, repositories):
-                issue_numbers.extend(repo_issue_numbers)
-                
-        # Save to cache
-        if issue_numbers:
-            print_flush(f"💾 Saving {len(issue_numbers)} issue numbers to cache")
-            with open(cache_file, 'w') as f:
-                for issue_number in issue_numbers:
-                    f.write(f"{issue_number}\n")
     
-    if not issue_numbers:
-        print_flush("❌ No issues found to process")
-        sys.exit(1)
-    
-    print_flush(f"📊 Total issues to process: {len(issue_numbers)}")
-    print_flush("=" * 60)
-    
-    # Process issues with concurrency control
-    timeout = httpx.Timeout(60.0, connect=30.0)
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    print_flush(f"⚡ Starting concurrent processing with max {max_concurrent} simultaneous requests...")
+    start_time = time.time()
+
+    timeout = httpx.Timeout(300.0, connect=60.0)  # Much higher timeouts to avoid network interference
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # Create updater instance
-        updater = GitHubProjectUpdater(
-            token=token,
-            repository=repository,
-            project_id=project_id,
-            work_started_field_id=work_started_field_id,
-            client=client,
-            max_concurrent=max_concurrent
-        )
-        
-        print_flush(f"🔄 Creating {len(issue_numbers)} processing tasks...")
-        # Create semaphore for concurrency control
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        async def process_with_semaphore(issue_number):
-            async with semaphore:
-                await updater.process_issue_with_infinite_retry(issue_number)
-        
-        tasks = [process_with_semaphore(issue_number) for issue_number in issue_numbers]
-        
-        print_flush(f"⚡ Starting concurrent processing with max {max_concurrent} simultaneous requests...")
-        start_time = time.time()
-        
-        # Add progress tracking
-        progress_task = asyncio.create_task(track_progress(updater, len(issue_numbers), start_time))
-        
-        # Process all issues
-        try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            progress_task.cancel()
+        async for repo_name, repo_issue_numbers in get_all_repository_issues(client, token, repositories):
+            
+            # Process issues with concurrency control
+            timeout = httpx.Timeout(60.0, connect=30.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                # Create updater instance
+                updater = GitHubProjectUpdater(
+                    token=token,
+                    repository=repository,
+                    project_id=project_id,
+                    work_started_field_id=work_started_field_id,
+                    client=client,
+                    max_concurrent=max_concurrent
+                )
+                
+                print_flush(f"🔄 Creating {len(repo_issue_numbers)} processing tasks...")
+            # Create semaphore for concurrency control
+            
+            async def process_with_semaphore(issue_number):
+                async with semaphore:
+                    await updater.process_issue_with_infinite_retry(issue_number)
+            
+            tasks = [process_with_semaphore(issue_number) for issue_number in repo_issue_numbers]
+            
+            
+            # Add progress tracking
+            progress_task = asyncio.create_task(track_progress(updater, len(issue_numbers), start_time))
+            
+            # Process all issues
             try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
         
         # Final statistics
         elapsed = time.time() - start_time
@@ -789,7 +764,14 @@ async def main():
         print_flush(f"❌ Issues with Errors: {updater.error_count}")
         if updater.processed_count > 0:
             print_flush(f"📈 Average Rate: {updater.processed_count / elapsed:.2f} issues/sec")
+        
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    global processed_issue_numbers
+    try:
+        asyncio.run(main())
+    finally:
+        # Save processed issue numbers to cache
+        with open(cache_file, 'w') as f:
+            json.dump(processed_issue_numbers, f)
