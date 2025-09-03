@@ -220,13 +220,20 @@ class GitHubProjectUpdater:
         )
         
         if not response or response.status_code != 200:
-            print(f"Failed to get issue #{issue_number} details")
+            print_flush(f"   ❌ HTTP {response.status_code if response else 'No response'} getting issue #{issue_number} details")
             return None
             
         try:
-            return response.json()
+            data = response.json()
+            
+            # Check for null response
+            if data is None:
+                print_flush(f"   ❌ Empty JSON response for issue #{issue_number}")
+                return None
+                
+            return data
         except Exception as e:
-            print(f"Failed to parse issue #{issue_number} JSON: {e}")
+            print_flush(f"   ❌ Failed to parse issue #{issue_number} JSON: {e}")
             return None
     
     async def find_project_item_id(self, issue_id: str) -> Optional[str]:
@@ -295,31 +302,55 @@ class GitHubProjectUpdater:
             )
             
             if not response or response.status_code != 200:
+                print_flush(f"   ❌ HTTP {response.status_code if response else 'No response'} searching for issue {issue_id}")
                 continue
                 
             try:
                 data = response.json()
                 
+                # Check for null response (like the bash version does)
+                if data is None:
+                    print_flush(f"   ❌ Empty JSON response for issue {issue_id}")
+                    continue
+                
+                # Check for GraphQL errors (matching workflow error handling)
                 if data.get("errors"):
                     if not self._handle_graphql_errors(data['errors'], f"finding project item for issue {issue_id}"):
                         return None  # Fatal permission error
                     break
                 
+                # Safely navigate the response structure
+                node_data = data.get("data")
+                if not node_data:
+                    print_flush(f"   ❌ No 'data' in GraphQL response for issue {issue_id}")
+                    continue
+                    
+                project_node = node_data.get("node")
+                if not project_node:
+                    print_flush(f"   ❌ No project 'node' in response for issue {issue_id}")
+                    continue
+                    
+                items_data = project_node.get("items")
+                if not items_data:
+                    print_flush(f"   ❌ No 'items' in project node for issue {issue_id}")
+                    continue
+                
                 # Look for the issue in current batch
-                items = data.get("data", {}).get("node", {}).get("items", {}).get("nodes", [])
+                items = items_data.get("nodes", [])
                 for item in items:
-                    if item.get("content", {}).get("id") == issue_id:
+                    if item and item.get("content", {}).get("id") == issue_id:
                         return item.get("id")
                 
                 # Check if there are more pages
-                page_info = data.get("data", {}).get("node", {}).get("items", {}).get("pageInfo", {})
+                page_info = items_data.get("pageInfo", {})
                 if not page_info.get("hasNextPage"):
                     break
                     
                 cursor = page_info.get("endCursor")
                 
             except Exception as e:
-                print(f"Error parsing project search response: {e}")
+                print_flush(f"   ❌ Error parsing project search response for issue {issue_id}: {e}")
+                print_flush(f"   📄 Response status: {response.status_code if response else 'No response'}")
                 break
         
         return None
@@ -378,20 +409,32 @@ class GitHubProjectUpdater:
         )
         
         if not response or response.status_code != 200:
+            print_flush(f"   ❌ HTTP {response.status_code if response else 'No response'} getting field values for item {item_id}")
             return None
             
         try:
             data = response.json()
             
+            # Check for null response (matching workflow pattern)  
+            if data is None:
+                print_flush(f"   ❌ Empty JSON response getting field values for item {item_id}")
+                return None
+            
+            # Check for GraphQL errors (matching workflow error handling)
             if data.get("errors"):
                 if not self._handle_graphql_errors(data['errors'], "getting field values"):
                     return None  # Fatal permission error
                 return None
                 
+            # Verify we have the expected structure
+            if not data.get("data"):
+                print_flush(f"   ❌ No 'data' in GraphQL response for field values")
+                return None
+                
             return data
             
         except Exception as e:
-            print(f"Error parsing field values response: {e}")
+            print_flush(f"   ❌ Error parsing field values response: {e}")
             return None
     
     async def update_work_started_field(self, item_id: str, date: str) -> bool:
@@ -426,20 +469,33 @@ class GitHubProjectUpdater:
         )
         
         if not response or response.status_code != 200:
+            print_flush(f"   ❌ HTTP {response.status_code if response else 'No response'} updating Work Started field")
             return False
             
         try:
             data = response.json()
             
+            # Check for null response (matching workflow pattern)
+            if data is None:
+                print_flush(f"   ❌ Empty JSON response updating Work Started field")
+                return False
+            
+            # Check for GraphQL errors (matching workflow error handling)
             if data.get("errors"):
                 if not self._handle_graphql_errors(data['errors'], "updating Work Started field"):
                     return False  # Fatal permission error
                 return False
                 
+            # Verify successful mutation (workflow checks for clientMutationId)
+            mutation_data = data.get("data", {}).get("updateProjectV2ItemFieldValue")
+            if not mutation_data:
+                print_flush(f"   ❌ No mutation data in update response")
+                return False
+                
             return True
             
         except Exception as e:
-            print(f"Error parsing update response: {e}")
+            print_flush(f"   ❌ Error parsing update response: {e}")
             return False
     
     async def process_issue(self, issue_number: int) -> None:
