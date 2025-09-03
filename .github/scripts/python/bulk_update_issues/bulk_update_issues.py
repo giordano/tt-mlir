@@ -18,10 +18,18 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 last_processed_issue_number = {}
 
+# Global debug mode flag
+DEBUG_MODE = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
+
 def print_flush(*args, **kwargs):
     """Print with immediate flush for GitHub Actions visibility."""
     print(*args, **kwargs)
     sys.stdout.flush()
+
+def debug_print(*args, **kwargs):
+    """Print debug messages only when DEBUG_MODE is enabled."""
+    if DEBUG_MODE:
+        print_flush(*args, **kwargs)
 
 
 async def track_progress(updater, total_issues: int, start_time: float):
@@ -81,7 +89,7 @@ class GitHubProjectUpdater:
     )
     async def make_api_request(self, method: str, url: str, **kwargs) -> httpx.Response:
         """Make API request with automatic retry using tenacity."""
-        print_flush(f"   🌐 Making {method} request to {url.replace(self.github_api_url, 'GitHub API')}")
+        debug_print(f"   🌐 Making {method} request to {url.replace(self.github_api_url, 'GitHub API')}")
         
         response = await self.client.request(method, url, **kwargs)
         
@@ -120,7 +128,7 @@ class GitHubProjectUpdater:
     async def find_project_item_id(self, issue_id: str) -> Optional[str]:
         """Find project item ID for an issue using GraphQL."""
         query = """
-        query($projectId: ID!, $issueId: ID!) {
+        query($projectId: ID!) {
           node(id: $projectId) {
             ... on ProjectV2 {
               items(first: 100) {
@@ -143,8 +151,7 @@ class GitHubProjectUpdater:
         """
         
         variables = {
-            "projectId": self.project_id,
-            "issueId": issue_id
+            "projectId": self.project_id
         }
         
         payload = {
@@ -322,7 +329,7 @@ class GitHubProjectUpdater:
             # Check for successful mutation
             mutation_data = data.get("data", {}).get("updateProjectV2ItemFieldValue")
             if mutation_data:
-                print_flush(f"   ✅ Updated Work Started field")
+                debug_print(f"   ✅ Updated Work Started field")
                 return True
             else:
                 print_flush(f"   ❌ No mutation data in update response")
@@ -338,7 +345,7 @@ class GitHubProjectUpdater:
         
         try:
             # Step 1: Get issue details
-            print_flush(f"   📋 Getting issue details...")
+            debug_print(f"   📋 Getting issue details...")
             issue_data = await asyncio.wait_for(
                 self.get_issue_details(issue_number), timeout=60.0
             )
@@ -354,10 +361,10 @@ class GitHubProjectUpdater:
                 self.error_count += 1
                 return
                 
-            print_flush(f"   ✅ Got issue details (ID: {issue_id})")
+            debug_print(f"   ✅ Got issue details (ID: {issue_id})")
             
             # Step 2: Find project item ID
-            print_flush(f"   🔍 Finding project item...")
+            debug_print(f"   🔍 Finding project item...")
             item_id = await asyncio.wait_for(
                 self.find_project_item_id(issue_id), timeout=60.0
             )
@@ -367,10 +374,10 @@ class GitHubProjectUpdater:
                 self.processed_count += 1
                 return
                 
-            print_flush(f"   ✅ Found project item (ID: {item_id})")
+            debug_print(f"   ✅ Found project item (ID: {item_id})")
             
             # Step 3: Get current field values
-            print_flush(f"   📊 Getting field values...")
+            debug_print(f"   📊 Getting field values...")
             field_values = await asyncio.wait_for(
                 self.get_issue_field_values(item_id), timeout=60.0
             )
@@ -387,7 +394,7 @@ class GitHubProjectUpdater:
             
             # Step 4: Update Work Started if needed
             if status == "In Progress" and not work_started:
-                print_flush(f"   🔧 Updating Work Started field...")
+                debug_print(f"   🔧 Updating Work Started field...")
                 today = time.strftime("%Y-%m-%d")
                 
                 success = await asyncio.wait_for(
@@ -519,6 +526,7 @@ async def main():
     print_flush(f"   Project ID: {project_id}")
     print_flush(f"   Work Started Field ID: {work_started_field_id}")
     print_flush(f"   Max Concurrent: {max_concurrent}")
+    print_flush(f"   Debug Mode: {DEBUG_MODE}")
     print_flush(f"   Token Type: {'PAT' if token.startswith('ghp_') else 'Other'}")
     
     # Try to read cached issue numbers first
